@@ -1,0 +1,22 @@
+# Ignore Xcode build files everywhere
+**/build/
+**/DerivedData/
+
+# User-specific settings
+**/*.xcuserdata/
+**/*.xcuserstate
+**/*.xcworkspace/xcuserdata/
+**/*.xcworkspace/
+**/xcuserdata/
+
+# macOS system files
+.DS_Store
+
+# Swift Package Manager
+**/.build/
+**/Package.resolved
+
+# Xcode project artifacts
+**/*.xccheckout
+**/*.moved-aside
+**/*.xcscmblueprint
