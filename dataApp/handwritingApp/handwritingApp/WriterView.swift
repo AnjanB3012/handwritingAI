@@ -23,6 +23,7 @@ struct WriterView: View {
     @State private var nextIndex: Int = 0
     @State private var isSubmitting: Bool = false
     @State private var errorMessage: String? = nil
+    @State private var clearCanvasTrigger: Int = 0
     @Environment(\.dismiss) private var dismiss
     
     private let apiCaller = APICaller()
@@ -62,11 +63,14 @@ struct WriterView: View {
                                     .strokeBorder(Color.gray.opacity(0.2), lineWidth: 1)
                             )
                             .overlay(
-                                PencilCanvasRepresentable { sample in
-                                    // Append to dictionary in chronological order: 0, 1, 2, ...
-                                    samplesByIndex[nextIndex] = sample
-                                    nextIndex += 1
-                                }
+                                PencilCanvasRepresentable(
+                                    clearTrigger: clearCanvasTrigger,
+                                    onSample: { sample in
+                                        // Append to dictionary in chronological order: 0, 1, 2, ...
+                                        samplesByIndex[nextIndex] = sample
+                                        nextIndex += 1
+                                    }
+                                )
                                 .frame(width: scaledWidth, height: scaledHeight)
                                 .clipped()
                             )
@@ -76,9 +80,30 @@ struct WriterView: View {
                 }
                 
                 // Submit button area
-                HStack {
+                HStack(spacing: 20) {
                     Spacer()
                     
+                    // Clear Page button
+                    Button(action: {
+                        clearPage()
+                    }) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "trash")
+                                .imageScale(.large)
+                            Text("Clear Page")
+                                .font(.title3.bold())
+                        }
+                        .padding(.horizontal, 40)
+                        .padding(.vertical, 16)
+                        .background(Color.red)
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                        .shadow(color: .black.opacity(0.2), radius: 8, x: 0, y: 4)
+                    }
+                    .disabled(samplesByIndex.isEmpty || isSubmitting)
+                    .opacity((samplesByIndex.isEmpty || isSubmitting) ? 0.5 : 1.0)
+                    
+                    // Submit button
                     Button(action: {
                         Task {
                             await submitStrokeData()
@@ -138,6 +163,12 @@ struct WriterView: View {
     
     // MARK: - API Methods
     
+    private func clearPage() {
+        samplesByIndex.removeAll()
+        nextIndex = 0
+        clearCanvasTrigger += 1
+    }
+    
     private func submitStrokeData() async {
         guard !samplesByIndex.isEmpty else { return }
         
@@ -162,9 +193,7 @@ struct WriterView: View {
             // After successful submission, clear canvas and reset (stay on writing view)
             await MainActor.run {
                 isSubmitting = false
-                samplesByIndex.removeAll()
-                nextIndex = 0
-                // Don't dismiss - stay on writing view for next text
+                clearPage()
             }
         } catch {
             await MainActor.run {
@@ -185,6 +214,7 @@ struct WriterView: View {
 private struct PencilCanvasRepresentable: UIViewRepresentable {
     typealias UIViewType = PencilCanvasUIView
     
+    let clearTrigger: Int
     let onSample: (PencilSample) -> Void
     
     func makeUIView(context: Context) -> PencilCanvasUIView {
@@ -196,7 +226,19 @@ private struct PencilCanvasRepresentable: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: PencilCanvasUIView, context: Context) {
-        // No-op
+        // Clear canvas when trigger changes
+        if context.coordinator.lastClearTrigger != clearTrigger {
+            uiView.clearCanvas()
+            context.coordinator.lastClearTrigger = clearTrigger
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+    
+    class Coordinator {
+        var lastClearTrigger: Int = 0
     }
 }
 
@@ -306,6 +348,13 @@ private final class PencilCanvasUIView: UIView {
         let combined = UIBezierPath()
         for p in paths { combined.append(p) }
         shapeLayer.path = combined.cgPath
+    }
+    
+    func clearCanvas() {
+        paths.removeAll()
+        currentPath = nil
+        shapeLayer.path = nil
+        setNeedsDisplay()
     }
     
     // MARK: - Sample Recording

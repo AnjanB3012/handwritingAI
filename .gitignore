@@ -37,3 +37,8 @@ backend/config.json
 backend/input_data.json
 backend/needed_data.json
 backend/test*.py
+
+# RNNModel
+RNNModel/my_model.keras
+RNNModel/my_model_metadata.json
+RNNModel/input_data.json
