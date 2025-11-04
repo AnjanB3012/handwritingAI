@@ -20,3 +20,20 @@
 **/*.xccheckout
 **/*.moved-aside
 **/*.xcscmblueprint
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.pyw
+**/*.pyz
+**/*.pywz
+**/*.pyzw
+**/*.pyzwz
+**/*.pyzwzw
+.env
+backend/config.json
+backend/input_data.json
+backend/needed_data.json
+backend/test*.py

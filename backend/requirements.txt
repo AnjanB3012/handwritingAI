@@ -1,0 +1,5 @@
+FastAPI
+uvicorn
+python-dotenv
+matplotlib
+tabulate
