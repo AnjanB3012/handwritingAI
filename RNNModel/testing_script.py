@@ -1,150 +1,269 @@
 # =============================================
-# test_handwriting_rnn.py - TensorFlow Version
+# test_handwriting_rnn.py - PyTorch Version
 # =============================================
-import tensorflow as tf
-from tensorflow import keras
+import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import json
 
-MODEL_PATH = "my_model.keras"
+MODEL_PATH = "my_model.pt"
+START_COORD_MODEL_PATH = "start_coord_model.pt"
+FINISHED_PROGRESS_MODEL_PATH = "finished_progress_model.pt"
 METADATA_PATH = "my_model_metadata.json"
 PAPER_WIDTH, PAPER_HEIGHT = 800, 1035
 
-# Average starting coordinates calculated from input_data.json (32 entries)
-# Calculated by finding the first point (minimum timestamp) in each entry
-AVG_START_X = 36.62
-AVG_START_Y = 40.97
+# Set device (CUDA if available)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 
-# ---------- MODEL (same as training) ----------
-class TextConditionedDecoder(keras.Model):
-    def __init__(self, vocab_size, input_size=5, embed_dim=64, hidden_size=256, output_size=5, **kwargs):
-        super().__init__(**kwargs)
+# ---------- MODEL CLASSES (same as training) ----------
+class TextConditionedDecoder(nn.Module):
+    def __init__(self, vocab_size, input_size=5, embed_dim=128, hidden_size=512, num_layers=2, output_size=6):
+        super().__init__()
         self.vocab_size = vocab_size
         self.input_size = input_size
         self.embed_dim = embed_dim
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.output_size = output_size
         
-        self.embedding = keras.layers.Embedding(vocab_size + 1, embed_dim, mask_zero=True)
-        self.lstm = keras.layers.LSTM(hidden_size, return_sequences=True, return_state=False)
-        self.fc = keras.layers.Dense(output_size)
-    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "vocab_size": self.vocab_size,
-            "input_size": self.input_size,
-            "embed_dim": self.embed_dim,
-            "hidden_size": self.hidden_size,
-            "output_size": self.output_size,
-        })
-        return config
-    
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
+        self.embedding = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(input_size + embed_dim, hidden_size, num_layers=num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
+        self.fc_hidden = nn.Linear(hidden_size, hidden_size // 2)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(hidden_size // 2, output_size)
+        self.sigmoid = nn.Sigmoid()
         
-    def call(self, inputs, training=None):
-        text, stroke_seq = inputs
-        
+    def forward(self, text, stroke_seq):
         # Encode text and average embeddings to form context vector
-        text_emb = self.embedding(text)  # (B, T, E)
+        text_emb = self.embedding(text)  # (B, T_text, E)
         
         # Mask out padding tokens (index 0) when averaging
-        # Get mask from embedding layer
-        mask = self.embedding.compute_mask(text)
-        if mask is not None:
-            mask = tf.cast(mask, tf.float32)
-            mask = tf.expand_dims(mask, axis=-1)  # (B, T, 1)
-            masked_emb = text_emb * mask
-            # Average over sequence length, excluding padding
-            context = tf.reduce_sum(masked_emb, axis=1, keepdims=True) / (
-                tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-8
-            )  # (B, 1, E)
-        else:
-            # If no mask, just average
-            context = tf.reduce_mean(text_emb, axis=1, keepdims=True)  # (B, 1, E)
+        text_mask = (text != 0).float()  # (B, T_text)
+        text_mask = text_mask.unsqueeze(-1)  # (B, T_text, 1)
+        
+        # Apply mask and average
+        masked_emb = text_emb * text_mask  # (B, T_text, E)
+        mask_sum = text_mask.sum(dim=1, keepdim=True)  # (B, 1, 1)
+        context = masked_emb.sum(dim=1, keepdim=True) / (mask_sum + 1e-8)  # (B, 1, E)
         
         # Repeat context for each timestep in stroke sequence
-        seq_len = tf.shape(stroke_seq)[1]
-        context = tf.repeat(context, seq_len, axis=1)  # (B, seq_len, E)
+        seq_len = stroke_seq.size(1)
+        context = context.repeat(1, seq_len, 1)  # (B, seq_len, E)
         
         # Concatenate stroke sequence with context
-        combined = tf.concat([stroke_seq, context], axis=-1)  # (B, seq_len, input_size + embed_dim)
+        combined = torch.cat([stroke_seq, context], dim=-1)  # (B, seq_len, input_size + embed_dim)
         
         # Pass through LSTM
-        out = self.lstm(combined, training=training)
+        out, _ = self.lstm(combined)  # (B, seq_len, hidden_size)
+        
+        # Pass through intermediate layer
+        out = self.fc_hidden(out)  # (B, seq_len, hidden_size // 2)
+        out = self.relu(out)
         
         # Final output layer
-        out = self.fc(out)
+        out = self.fc(out)  # (B, seq_len, output_size)
+        
+        # Apply sigmoid to finished (last dimension)
+        stroke_features = out[:, :, :5]  # (B, seq_len, 5)
+        finished_logit = out[:, :, 5:6]  # (B, seq_len, 1)
+        finished = self.sigmoid(finished_logit)  # (B, seq_len, 1) - sigmoid activated
+        
+        # Concatenate back
+        out = torch.cat([stroke_features, finished], dim=-1)  # (B, seq_len, 6)
+        
         return out
 
 
+class StartCoordPredictor(nn.Module):
+    """DNN model to predict starting coordinates (x, y) from restricted inputs"""
+    def __init__(self, vocab_size, embed_dim=32, hidden_dims=[128, 64], output_size=2):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.output_size = output_size
+        
+        self.embedding = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)
+        
+        layers = []
+        input_dim = embed_dim + 2
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.2))
+            input_dim = hidden_dim
+        
+        layers.append(nn.Linear(input_dim, output_size))
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, first_char_idx, len_features):
+        first_char_emb = self.embedding(first_char_idx)  # (B, E)
+        features = torch.cat([first_char_emb, len_features], dim=-1)  # (B, E+2)
+        coords = self.network(features)  # (B, 2)
+        return coords
+
+
+class FinishedProgressPredictor(nn.Module):
+    """Predicts fraction of strokes completed at each timestep given text and stroke input."""
+    def __init__(self, vocab_size, input_size=5, embed_dim=64, hidden_size=256, num_layers=1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(input_size + embed_dim, hidden_size, num_layers=num_layers, batch_first=True, dropout=0.0)
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, text, stroke_seq):
+        text_emb = self.embedding(text)
+        text_mask = (text != 0).float().unsqueeze(-1)
+        masked_emb = text_emb * text_mask
+        mask_sum = text_mask.sum(dim=1, keepdim=True)
+        context = masked_emb.sum(dim=1, keepdim=True) / (mask_sum + 1e-8)
+        seq_len = stroke_seq.size(1)
+        context_rep = context.repeat(1, seq_len, 1)
+        combined = torch.cat([stroke_seq, context_rep], dim=-1)
+        out, _ = self.lstm(combined)
+        out = self.fc(out)
+        progress = self.sigmoid(out)
+        return progress  # (B, T, 1)
+
+
 # ---------- GENERATION ----------
-def generate(model, text_seq, char2idx, mean, std, steps=300):
+def generate(model, start_coord_model, finished_progress_model, text_seq, char2idx, mean, std, start_coord_mean, start_coord_std, length_norm_stats, max_steps=1200):
     """
-    Generate handwriting strokes from text.
-    Model outputs [dx, dy, dt, pressure, tilt] where:
+    Generate handwriting strokes from text until finished > 0.9.
+    Model outputs [dx, dy, dt, pressure, tilt, finished] where:
     - dx, dy: delta movement from previous point
-    - dt: absolute time from start (like in training)
+    - dt: absolute time from start
     - pressure: pen pressure (0-1)
     - tilt: pen tilt angle
+    - finished: sigmoid value (0-1), indicates if stroke is complete
     """
-    model.trainable = False  # Set to evaluation mode
+    model.eval()
+    start_coord_model.eval()
+    finished_progress_model.eval()
     
-    # Create text tensor
-    text_array = np.array([[char2idx.get(c, 0) for c in text_seq]], dtype=np.int32)
-    text_tensor = tf.constant(text_array)
+    # Prepare text tensors and restricted features for start coord prediction
+    text_array = np.array([[char2idx.get(c, 0) for c in text_seq]], dtype=np.int64)
+    text_tensor = torch.from_numpy(text_array).long().to(device)
+    first_char = text_seq[0] if len(text_seq) > 0 else ""
+    first_char_idx = char2idx.get(first_char, 0)
+    first_char_tensor = torch.tensor([first_char_idx], dtype=torch.long).to(device)
+    first_word = text_seq.split()[0] if len(text_seq.split()) > 0 else ""
+    len_first_word = float(len(first_word))
+    len_text = float(len(text_seq))
+    len_first_word_mean = length_norm_stats['len_first_word_mean']
+    len_first_word_std = length_norm_stats['len_first_word_std']
+    len_text_mean = length_norm_stats['len_text_mean']
+    len_text_std = length_norm_stats['len_text_std']
+    len_features = np.array([
+        (len_first_word - len_first_word_mean) / (len_first_word_std + 1e-8),
+        (len_text - len_text_mean) / (len_text_std + 1e-8)
+    ], dtype=np.float32).reshape(1, 2)
+    len_features_tensor = torch.from_numpy(len_features).float().to(device)
+
+    with torch.no_grad():
+        start_coord_norm = start_coord_model(first_char_tensor, len_features_tensor)  # (1, 2)
+        start_coord_norm_np = start_coord_norm.cpu().numpy()[0]
+        
+    # Denormalize starting coordinates
+    start_coord = start_coord_norm_np * start_coord_std + start_coord_mean
+    start_x, start_y = start_coord[0], start_coord[1]
+    
+    print(f"Predicted starting coordinates: ({start_x:.2f}, {start_y:.2f})")
+    
+    # Convert mean and std to tensors
+    mean_tensor = torch.from_numpy(mean).float().to(device)
+    std_tensor = torch.from_numpy(std).float().to(device)
     
     # Build up stroke sequence autoregressively
     # Start with initial zero stroke [dx=0, dy=0, dt=0, pressure=0, tilt=0]
-    stroke_seq = tf.zeros((1, 1, 5), dtype=tf.float32)
+    # IMPORTANT: Store in normalized form from the start to avoid double normalization
+    initial_point = torch.zeros((1, 1, 5), dtype=torch.float32).to(device)
+    # Normalize the initial point (zeros will become -mean/std)
+    initial_point[:, :, :3] = (initial_point[:, :, :3] - mean_tensor) / std_tensor
+    stroke_seq = initial_point
     strokes = []
-
-    # Convert mean and std to numpy arrays if they aren't already
-    mean_np = np.array(mean, dtype=np.float32)
-    std_np = np.array(std, dtype=np.float32)
-    mean_tensor = tf.constant(mean_np, dtype=tf.float32)
-    std_tensor = tf.constant(std_np, dtype=tf.float32)
     
-    for step in range(steps):
-        # Model expects normalized inputs (dx, dy, dt normalized)
-        # But we'll work with unnormalized for generation and normalize on the fly
+    print("\nGenerating strokes...")
+    print("-" * 80)
+    
+    # Track if we're stuck (generating same values)
+    prev_dx, prev_dy = None, None
+    stuck_count = 0
+    STUCK_THRESHOLD = 5  # If same dx/dy for 5 steps, add noise
+    
+    for step in range(max_steps):
+        # IMPORTANT: stroke_seq contains ALL previous steps in NORMALIZED form (grows each iteration)
+        # Sequence length: step + 1 (includes initial zero point + all generated points)
+        seq_len = stroke_seq.size(1)
+        
+        # stroke_seq is already normalized, so use it directly
         stroke_seq_norm = stroke_seq
         
-        # Normalize dx, dy, dt (first 3 features) using saved mean/std
-        stroke_seq_norm_slice = stroke_seq[:, :, :3]
-        stroke_seq_norm_slice = (stroke_seq_norm_slice - mean_tensor) / std_tensor
-        stroke_seq_norm = tf.concat([
-            stroke_seq_norm_slice,
-            stroke_seq[:, :, 3:]
-        ], axis=-1)
-        
-        # Get prediction from model
-        out = model([text_tensor, stroke_seq_norm], training=False)  # (B, seq_len, 5)
+        # Get prediction from model - model processes entire sequence with all previous steps
+        with torch.no_grad():
+            out = model(text_tensor, stroke_seq_norm)  # (1, seq_len, 6)
+            progress_pred = finished_progress_model(text_tensor, stroke_seq_norm)  # (1, seq_len, 1)
         
         # Take the last prediction for autoregressive generation
-        output = out[0, -1].numpy()
+        # This prediction is based on the full sequence context
+        output = out[0, -1].cpu().numpy()  # (6,)
+        # Fix deprecation warning: extract scalar properly
+        progress_value = float(progress_pred[0, -1].item())
         
-        # Denormalize dx, dy, dt
-        output[:3] = output[:3] * std_np + mean_np
+        # Extract finished parameter and progress
+        finished = output[5]
         
-        # Process output similar to training script format:
-        # [dx, dy, dt, pressure, tilt]
-        dx, dy, dt_raw, pressure_raw, tilt_raw = output
+        # Denormalize dx, dy, dt BEFORE processing
+        dx_pred = output[0] * std[0] + mean[0]
+        dy_pred = output[1] * std[1] + mean[1]
+        dt_raw = output[2] * std[2] + mean[2]
         
-        # Clamp pressure to [0, 1] range (typical pressure range)
+        # Check for NaN or invalid values
+        if np.isnan(dx_pred) or np.isnan(dy_pred) or np.isinf(dx_pred) or np.isinf(dy_pred):
+            print(f"Warning: NaN/Inf detected at step {step+1}, using previous values")
+            if prev_dx is not None and prev_dy is not None:
+                dx_pred, dy_pred = prev_dx, prev_dy
+            else:
+                dx_pred, dy_pred = 0.0, 0.0
+        
+        # Check if we're stuck in a loop (same dx/dy)
+        if prev_dx is not None and prev_dy is not None:
+            if abs(dx_pred - prev_dx) < 1e-5 and abs(dy_pred - prev_dy) < 1e-5:
+                stuck_count += 1
+                # Add small random noise to break out of loop if stuck
+                if stuck_count >= STUCK_THRESHOLD:
+                    noise_scale = 0.1
+                    dx_pred += np.random.normal(0, noise_scale * abs(std[0]))
+                    dy_pred += np.random.normal(0, noise_scale * abs(std[1]))
+                    stuck_count = 0  # Reset counter
+                    if step % 50 == 0:  # Only print occasionally
+                        print(f"  [Stuck detected, adding noise to break loop]")
+            else:
+                stuck_count = 0
+        
+        prev_dx, prev_dy = dx_pred, dy_pred
+        
+        # Process output: [dx, dy, dt, pressure, tilt, finished]
+        dx, dy = dx_pred, dy_pred
+        pressure_raw = output[3]
+        tilt_raw = output[4]
+        
+        # Print debug info including sequence length and dx/dy to verify all steps are included
+        # and diagnose straight line issue
+        if step < 10 or step % 50 == 0:
+            print(f"Step {step+1:4d}: seq_len={seq_len:4d}, dx={dx:8.4f}, dy={dy:8.4f}, finished={finished:.4f}, progress={progress_value:.4f}")
+        
+        # Clamp pressure to [0, 1] range
         pressure = np.clip(pressure_raw, 0.0, 1.0)
         
-        # Tilt is typically in radians, keep raw value but ensure reasonable range
-        # (typical tilt range might be -π/2 to π/2, but keeping flexible)
+        # Keep tilt as-is
         tilt = tilt_raw
         
-        # dt in training is absolute time from start (curr["timestamp"] - t0)
-        # For generation, we'll use the model's predicted absolute time
         # Ensure non-negative time
         dt = max(0.0, dt_raw)
         
@@ -152,37 +271,49 @@ def generate(model, text_seq, char2idx, mean, std, steps=300):
         stroke = np.array([dx, dy, dt, pressure, tilt])
         strokes.append(stroke)
         
-        # Append to sequence for next iteration
-        new_point = tf.constant([[[dx, dy, dt, pressure, tilt]]], dtype=tf.float32)
-        stroke_seq = tf.concat([stroke_seq, new_point], axis=1)
-
-    return np.array(strokes)
+        # Stopping conditions: progress > 0.9 or steps >= 1200
+        # Also stop if finished signal is high enough
+        if progress_value > 0.9 or finished > 0.5 or (step + 1) >= max_steps:
+            reason = "progress > 0.9" if progress_value > 0.9 else ("finished > 0.5" if finished > 0.5 else f">= {max_steps} steps")
+            print(f"\nStopping generation ({reason}).")
+            print(f"Total strokes generated: {len(strokes)}")
+            break
+        
+        # Append NORMALIZED values to sequence for next iteration
+        # This is critical: we need to normalize before appending
+        dx_norm = (dx - mean[0]) / std[0]
+        dy_norm = (dy - mean[1]) / std[1]
+        dt_norm = (dt - mean[2]) / std[2]
+        new_point = torch.tensor([[[dx_norm, dy_norm, dt_norm, pressure, tilt]]], dtype=torch.float32).to(device)
+        stroke_seq = torch.cat([stroke_seq, new_point], dim=1)
+    
+    if len(strokes) == max_steps:
+        print(f"\nMaximum steps ({max_steps}) reached. Stopping generation.")
+    
+    return np.array(strokes), (start_x, start_y)
 
 
 # ---------- CONVERT STROKES TO INPUT_DATA FORMAT ----------
-def strokes_to_input_data_format(strokes):
+def strokes_to_input_data_format(strokes, start_coords):
     """
     Convert generated strokes to input_data.json format (stroke_data dictionary).
     
     Args:
         strokes: Array of strokes with format [dx, dy, dt, pressure, tilt]
+        start_coords: Tuple of (start_x, start_y)
     
     Returns:
-        Dictionary in input_data format: {point_id: {"coordinates": [x, y], "timestamp": dt, "pressure": p, "tilt": tilt}, ...}
+        Dictionary in input_data format
     """
-    # Use average starting coordinates from input_data.json
-    x, y = AVG_START_X, AVG_START_Y
+    x, y = start_coords
     stroke_data = {}
     
     for i, (dx, dy, dt, pressure, tilt) in enumerate(strokes):
         x += dx
         y += dy
         
-        # Use absolute timestamp from model (dt), or relative if needed
-        # The model outputs absolute time, so we'll use it directly
         timestamp = float(dt)
         
-        # Use point index as string ID (like in input_data format)
         point_id = str(i)
         
         stroke_data[point_id] = {
@@ -195,78 +326,16 @@ def strokes_to_input_data_format(strokes):
     return stroke_data
 
 
-# ---------- PRINT GENERATED DATA ----------
-def print_generated_data(strokes, text):
-    """Print detailed information about the generated strokes."""
-    print("\n" + "="*80)
-    print("GENERATED STROKE DATA")
-    print("="*80)
-    print(f"Input Text: \"{text}\"")
-    print(f"Total Strokes Generated: {len(strokes)}")
-    print(f"\nStroke Format: [dx, dy, dt, pressure, tilt]")
-    print("-"*80)
-    
-    # Use average starting coordinates from input_data.json
-    x, y = AVG_START_X, AVG_START_Y
-    coords = []
-    for i, (dx, dy, dt, p, tilt) in enumerate(strokes):
-        x += dx
-        y += dy
-        coords.append((x, y))
-    
-    # Print first 10 and last 10 strokes
-    print("\nFirst 10 strokes:")
-    for i in range(min(10, len(strokes))):
-        dx, dy, dt, p, tilt = strokes[i]
-        x, y = coords[i]
-        print(f"  Stroke {i+1:3d}: dx={dx:8.4f}, dy={dy:8.4f}, dt={dt:8.4f}, "
-              f"pressure={p:.4f}, tilt={tilt:.4f} -> (x={x:8.2f}, y={y:8.2f})")
-    
-    if len(strokes) > 20:
-        print("  ...")
-        print("\nLast 10 strokes:")
-        for i in range(max(10, len(strokes)-10), len(strokes)):
-            dx, dy, dt, p, tilt = strokes[i]
-            x, y = coords[i]
-            print(f"  Stroke {i+1:3d}: dx={dx:8.4f}, dy={dy:8.4f}, dt={dt:8.4f}, "
-                  f"pressure={p:.4f}, tilt={tilt:.4f} -> (x={x:8.2f}, y={y:8.2f})")
-    
-    # Print statistics
-    pressures = strokes[:, 3]
-    tilts = strokes[:, 4]
-    dx_values = strokes[:, 0]
-    dy_values = strokes[:, 1]
-    
-    print("\n" + "-"*80)
-    print("STATISTICS:")
-    print("-"*80)
-    print(f"Coordinate Range:")
-    print(f"  X: [{min([c[0] for c in coords]):.2f}, {max([c[0] for c in coords]):.2f}]")
-    print(f"  Y: [{min([c[1] for c in coords]):.2f}, {max([c[1] for c in coords]):.2f}]")
-    print(f"\nDelta Values:")
-    print(f"  dx: min={np.min(dx_values):.4f}, max={np.max(dx_values):.4f}, "
-          f"mean={np.mean(dx_values):.4f}, std={np.std(dx_values):.4f}")
-    print(f"  dy: min={np.min(dy_values):.4f}, max={np.max(dy_values):.4f}, "
-          f"mean={np.mean(dy_values):.4f}, std={np.std(dy_values):.4f}")
-    print(f"\nPressure:")
-    print(f"  min={np.min(pressures):.4f}, max={np.max(pressures):.4f}, "
-          f"mean={np.mean(pressures):.4f}, std={np.std(pressures):.4f}")
-    print(f"\nTilt:")
-    print(f"  min={np.min(tilts):.4f}, max={np.max(tilts):.4f}, "
-          f"mean={np.mean(tilts):.4f}, std={np.std(tilts):.4f}")
-    print("="*80 + "\n")
-
-
-# ---------- VISUALIZATION (EXACT COPY FROM test.py) ----------
+# ---------- VISUALIZATION (from backend/test.py) ----------
 def sort_points_by_timestamp(stroke_data):
     """Sort points chronologically by timestamp."""
     sorted_items = sorted(stroke_data.items(), key=lambda x: x[1]["timestamp"])
     return [item[1] for item in sorted_items]
 
-def visualize(stroke_data, entry_text):
+def reconstruct_stroke(stroke_data, entry_text=None):
     """
-    Visualize generated strokes using exact same logic as test.py in backend.
-    This function is a copy of reconstruct_stroke from test.py.
+    Reconstruct Apple Pencil stroke with exact coordinates, pressure, and tilt.
+    This function replicates the logic from backend/test.py
     """
     # Sort points chronologically
     points = sort_points_by_timestamp(stroke_data)
@@ -330,7 +399,7 @@ def visualize(stroke_data, entry_text):
     ax1.set_xlim(-10, PAPER_WIDTH + 10)
     ax1.set_ylim(PAPER_HEIGHT + 10, -10)
     ax1.set_aspect('equal')
-    ax1.set_title(f"Reconstructed Stroke\n{entry_text if entry_text else 'Apple Pencil Data'}", 
+    ax1.set_title(f"Reconstructed Stroke\n{entry_text if entry_text else 'Generated Handwriting'}", 
                   fontsize=14, fontweight='bold')
     ax1.set_xlabel("X coordinate (pixels)", fontsize=10)
     ax1.set_ylabel("Y coordinate (pixels)", fontsize=10)
@@ -396,10 +465,10 @@ Y Range: [{min(y_coords):.1f}, {max(y_coords):.1f}]"""
 
 # ---------- MAIN ----------
 def main():
-    # Load Keras model with custom class
-    model = keras.models.load_model(MODEL_PATH, custom_objects={'TextConditionedDecoder': TextConditionedDecoder})
+    # Load PyTorch models
+    print("Loading models...")
     
-    # Load metadata from JSON file
+    # Load metadata
     with open(METADATA_PATH, 'r') as f:
         metadata = json.load(f)
     
@@ -407,23 +476,79 @@ def main():
     vocab_size = metadata["vocab_size"]
     mean = np.array(metadata["mean"], dtype=np.float32)
     std = np.array(metadata["std"], dtype=np.float32)
+    start_coord_mean = np.array(metadata["start_coord_mean"], dtype=np.float32)
+    start_coord_std = np.array(metadata["start_coord_std"], dtype=np.float32)
     
-    # Convert idx2char keys back to integers (they were saved as strings)
-    idx2char = {int(k): v for k, v in metadata["idx2char"].items()}
+    # Load RNN model
+    rnn_checkpoint = torch.load(MODEL_PATH, map_location=device)
+    rnn_config = rnn_checkpoint['model_config']
+    model = TextConditionedDecoder(
+        vocab_size=rnn_config['vocab_size'],
+        input_size=rnn_config['input_size'],
+        embed_dim=rnn_config.get('embed_dim', 128),  # Default to new size if not in config
+        hidden_size=rnn_config.get('hidden_size', 512),
+        num_layers=rnn_config.get('num_layers', 2),
+        output_size=rnn_config['output_size']
+    )
+    model.load_state_dict(rnn_checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    print("✅ RNN model loaded")
+    
+    # Load Start Coord DNN model
+    start_coord_checkpoint = torch.load(START_COORD_MODEL_PATH, map_location=device)
+    start_coord_config = start_coord_checkpoint['model_config']
+    start_coord_model = StartCoordPredictor(
+        vocab_size=start_coord_config['vocab_size'],
+        embed_dim=start_coord_config['embed_dim'],
+        hidden_dims=start_coord_config['hidden_dims'],
+        output_size=start_coord_config['output_size']
+    )
+    start_coord_model.load_state_dict(start_coord_checkpoint['model_state_dict'])
+    start_coord_model = start_coord_model.to(device)
+    start_coord_model.eval()
+    print("✅ Start Coord DNN model loaded")
 
-    text = input("Enter text to generate handwriting: ").strip()
-    print(f"Generating handwriting for: {text}")
+    # Length normalization stats for start coord inputs
+    length_norm_stats = {
+        'len_first_word_mean': float(start_coord_checkpoint.get('len_first_word_mean', 0.0)),
+        'len_first_word_std': float(start_coord_checkpoint.get('len_first_word_std', 1.0)),
+        'len_text_mean': float(start_coord_checkpoint.get('len_text_mean', 0.0)),
+        'len_text_std': float(start_coord_checkpoint.get('len_text_std', 1.0)),
+    }
 
-    strokes = generate(model, text, char2idx, mean, std, steps=300)
+    # Load Finished Progress model
+    progress_checkpoint = torch.load(FINISHED_PROGRESS_MODEL_PATH, map_location=device)
+    progress_config = progress_checkpoint['model_config']
+    finished_progress_model = FinishedProgressPredictor(
+        vocab_size=progress_config['vocab_size'],
+        input_size=progress_config['input_size'],
+        embed_dim=progress_config.get('embed_dim', 64),
+        hidden_size=progress_config.get('hidden_size', 256),
+        num_layers=progress_config.get('num_layers', 1)
+    )
+    finished_progress_model.load_state_dict(progress_checkpoint['model_state_dict'])
+    finished_progress_model = finished_progress_model.to(device)
+    finished_progress_model.eval()
+    print("✅ Finished Progress model loaded")
     
-    # Convert strokes to input_data format (stroke_data dictionary)
-    stroke_data = strokes_to_input_data_format(strokes)
+    # Get user input
+    text = input("\nEnter text to generate handwriting: ").strip()
+    print(f"\nGenerating handwriting for: '{text}'")
     
-    # Print the generated data
-    print_generated_data(strokes, text)
+    # Generate strokes
+    strokes, start_coords = generate(
+        model, start_coord_model, finished_progress_model, text, char2idx,
+        mean, std, start_coord_mean, start_coord_std, length_norm_stats,
+        max_steps=1200
+    )
     
-    # Visualize the strokes using exact same logic as test.py
-    visualize(stroke_data, text)
+    # Convert strokes to input_data format
+    stroke_data = strokes_to_input_data_format(strokes, start_coords)
+    
+    # Visualize the strokes using the same function as backend/test.py
+    print("\nDisplaying visualization...")
+    reconstruct_stroke(stroke_data, text)
 
 
 if __name__ == "__main__":
