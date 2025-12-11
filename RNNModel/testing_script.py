@@ -7,11 +7,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import json
+import os
+import sys
+import subprocess
+import tempfile
 
 MODEL_PATH = "my_model.pt"
 START_COORD_MODEL_PATH = "start_coord_model.pt"
 FINISHED_PROGRESS_MODEL_PATH = "finished_progress_model.pt"
 METADATA_PATH = "my_model_metadata.json"
+
+# CUDA C++ executable paths (optional)
+CUDA_MODEL_BIN_PATH = "../RNNCuda/data.bin"
+CUDA_RUN_EXEC_PATH = "../RNNCuda/run_exec"
+USE_CUDA_EXEC = False  # Set to True to use CUDA C++ executable instead
+
 PAPER_WIDTH, PAPER_HEIGHT = 800, 1035
 
 # Set device (CUDA if available)
@@ -463,8 +473,114 @@ Y Range: [{min(y_coords):.1f}, {max(y_coords):.1f}]"""
     plt.show()
 
 
+# ---------- GENERATION USING CUDA EXECUTABLE ----------
+def generate_with_cuda_executable(text, model_bin_path, run_exec_path):
+    """
+    Generate handwriting strokes using the CUDA C++ executable.
+    
+    Args:
+        text: Input text string
+        model_bin_path: Path to the .bin model file
+        run_exec_path: Path to the run_exec executable
+    
+    Returns:
+        stroke_data: Dictionary in input_data format
+    """
+    # Create temporary files
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as input_file:
+        input_file.write(text)
+        input_txt_path = input_file.name
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as output_file:
+        output_json_path = output_file.name
+    
+    try:
+        # Run the CUDA executable
+        print(f"Running CUDA executable: {run_exec_path}")
+        print(f"Model: {model_bin_path}")
+        
+        result = subprocess.run(
+            [run_exec_path, model_bin_path, input_txt_path, output_json_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        print("CUDA executable output:")
+        print(result.stdout)
+        if result.stderr:
+            print("CUDA executable errors:")
+            print(result.stderr)
+        
+        # Read the generated JSON
+        with open(output_json_path, 'r') as f:
+            stroke_data = json.load(f)
+        
+        return stroke_data
+    
+    except subprocess.CalledProcessError as e:
+        print(f"Error running CUDA executable: {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise
+    
+    except FileNotFoundError:
+        print(f"Error: Could not find executable at {run_exec_path}")
+        print("Make sure you have compiled the CUDA code with 'make' in the RNNCuda directory")
+        raise
+    
+    finally:
+        # Clean up temporary files
+        try:
+            os.unlink(input_txt_path)
+            os.unlink(output_json_path)
+        except:
+            pass
+
+
 # ---------- MAIN ----------
 def main():
+    # Check if we should use CUDA executable
+    if USE_CUDA_EXEC:
+        if not os.path.exists(CUDA_RUN_EXEC_PATH):
+            print(f"Error: CUDA executable not found at {CUDA_RUN_EXEC_PATH}")
+            print("Please compile the CUDA code first:")
+            print("  cd ../RNNCuda && make")
+            return
+        
+        if not os.path.exists(CUDA_MODEL_BIN_PATH):
+            print(f"Error: Model binary not found at {CUDA_MODEL_BIN_PATH}")
+            print("Please train the model first:")
+            print(f"  cd ../RNNCuda && ./training_exec {CUDA_MODEL_BIN_PATH} input_data.json")
+            return
+        
+        # Get user input
+        text = input("\nEnter text to generate handwriting: ").strip()
+        if not text:
+            print("No text provided. Exiting.")
+            return
+        
+        print(f"\nGenerating handwriting for: '{text}'")
+        print("Using CUDA C++ model...")
+        
+        try:
+            # Generate strokes using CUDA executable
+            stroke_data = generate_with_cuda_executable(text, CUDA_MODEL_BIN_PATH, CUDA_RUN_EXEC_PATH)
+            
+            print(f"\nGenerated {len(stroke_data)} stroke points")
+            
+            # Visualize the strokes
+            print("\nDisplaying visualization...")
+            reconstruct_stroke(stroke_data, text)
+            
+        except Exception as e:
+            print(f"\nError during generation: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return
+    
+    # Original PyTorch code path
     # Load PyTorch models
     print("Loading models...")
     
