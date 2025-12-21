@@ -5,95 +5,242 @@
 #include <algorithm>
 #include <cctype>
 #include <set>
+#include <cstdlib>
+#include <cstring>
 
-// Simple JSON parser - handles the specific format of input_data.json
+// Helper to skip whitespace
+static void skipWhitespace(const char*& p) {
+    while(*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+}
+
+// Helper to parse a number
+static float parseNumber(const char*& p) {
+    skipWhitespace(p);
+    char* end;
+    float val = strtof(p, &end);
+    p = end;
+    return val;
+}
+
+// Helper to parse a string (returns content between quotes)
+static std::string parseString(const char*& p) {
+    skipWhitespace(p);
+    if(*p != '"') return "";
+    p++; // skip opening quote
+    const char* start = p;
+    while(*p && *p != '"') p++;
+    std::string result(start, p - start);
+    if(*p == '"') p++; // skip closing quote
+    return result;
+}
+
+// Helper to find a key in JSON object
+static bool findKey(const char*& p, const char* key) {
+    size_t keyLen = strlen(key);
+    while(*p) {
+        skipWhitespace(p);
+        if(*p == '}') return false; // end of object
+        if(*p == '"') {
+            p++;
+            const char* keyStart = p;
+            while(*p && *p != '"') p++;
+            size_t foundLen = p - keyStart;
+            if(foundLen == keyLen && strncmp(keyStart, key, keyLen) == 0) {
+                if(*p == '"') p++;
+                skipWhitespace(p);
+                if(*p == ':') p++;
+                return true;
+            }
+            if(*p == '"') p++;
+        }
+        // Skip to next key-value pair
+        while(*p && *p != ',' && *p != '}') {
+            if(*p == '{') {
+                int depth = 1;
+                p++;
+                while(*p && depth > 0) {
+                    if(*p == '{') depth++;
+                    else if(*p == '}') depth--;
+                    p++;
+                }
+            } else if(*p == '[') {
+                int depth = 1;
+                p++;
+                while(*p && depth > 0) {
+                    if(*p == '[') depth++;
+                    else if(*p == ']') depth--;
+                    p++;
+                }
+            } else if(*p == '"') {
+                p++;
+                while(*p && *p != '"') {
+                    if(*p == '\\' && *(p+1)) p++;
+                    p++;
+                }
+                if(*p == '"') p++;
+            } else {
+                p++;
+            }
+        }
+        if(*p == ',') p++;
+    }
+    return false;
+}
+
 std::vector<TrainingEntry> parseTrainingJSON(const char* filename) {
     std::vector<TrainingEntry> entries;
-    std::ifstream file(filename);
+    std::ifstream file(filename, std::ios::binary);
     if(!file.is_open()) {
         std::cerr << "Error: Cannot open file " << filename << std::endl;
         return entries;
     }
     
+    // Read entire file
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     
-    // Find entries array
-    size_t pos = content.find('[');
-    if(pos == std::string::npos) return entries;
+    std::cout << "Read " << content.size() << " bytes from " << filename << std::endl;
     
-    pos++;
+    const char* p = content.c_str();
+    skipWhitespace(p);
     
-    while(pos < content.length()) {
-        // Skip whitespace
-        while(pos < content.length() && std::isspace(content[pos])) pos++;
-        if(pos >= content.length() || content[pos] == ']') break;
+    if(*p != '[') {
+        std::cerr << "Error: Expected '[' at start of JSON array" << std::endl;
+        return entries;
+    }
+    p++; // skip '['
+    
+    int entryCount = 0;
+    while(*p) {
+        skipWhitespace(p);
+        if(*p == ']') break; // end of array
+        if(*p == ',') { p++; continue; }
+        
+        if(*p != '{') {
+            std::cerr << "Error: Expected '{' at start of entry, got '" << *p << "'" << std::endl;
+            break;
+        }
+        p++; // skip '{'
         
         TrainingEntry entry;
+        bool foundText = false;
+        bool foundStroke = false;
         
-        // Find entry_text
-        size_t text_pos = content.find("\"entry_text\"", pos);
-        if(text_pos == std::string::npos) break;
-        text_pos = content.find(':', text_pos);
-        text_pos = content.find('"', text_pos) + 1;
-        size_t text_end = content.find('"', text_pos);
-        entry.entry_text = content.substr(text_pos, text_end - text_pos);
-        
-        // Find stroke_data
-        size_t stroke_pos = content.find("\"stroke_data\"", text_end);
-        if(stroke_pos == std::string::npos) break;
-        stroke_pos = content.find('{', stroke_pos);
-        
-        // Parse stroke points
-        size_t point_start = stroke_pos + 1;
-        while(true) {
-            // Find next point key
-            size_t key_start = content.find('"', point_start);
-            if(key_start == std::string::npos || content[key_start-1] == '{') break;
+        // Parse entry object
+        while(*p && *p != '}') {
+            skipWhitespace(p);
+            if(*p == ',') { p++; continue; }
+            if(*p != '"') break;
             
-            size_t key_end = content.find('"', key_start + 1);
-            std::string point_id = content.substr(key_start + 1, key_end - key_start - 1);
+            // Parse key
+            p++; // skip opening quote
+            const char* keyStart = p;
+            while(*p && *p != '"') p++;
+            std::string key(keyStart, p - keyStart);
+            if(*p == '"') p++;
             
-            // Find coordinates
-            size_t coord_pos = content.find("\"coordinates\"", key_end);
-            coord_pos = content.find('[', coord_pos);
-            size_t coord_end = content.find(']', coord_pos);
-            std::string coord_str = content.substr(coord_pos + 1, coord_end - coord_pos - 1);
+            skipWhitespace(p);
+            if(*p == ':') p++;
+            skipWhitespace(p);
             
-            StrokePoint point;
-            sscanf(coord_str.c_str(), "%f,%f", &point.coordinates[0], &point.coordinates[1]);
-            
-            // Find timestamp
-            size_t ts_pos = content.find("\"timestamp\"", coord_end);
-            ts_pos = content.find(':', ts_pos);
-            sscanf(content.c_str() + ts_pos, ":%f", &point.timestamp);
-            
-            // Find pressure
-            size_t press_pos = content.find("\"pressure\"", ts_pos);
-            press_pos = content.find(':', press_pos);
-            sscanf(content.c_str() + press_pos, ":%f", &point.pressure);
-            
-            // Find tilt
-            size_t tilt_pos = content.find("\"tilt\"", press_pos);
-            tilt_pos = content.find(':', tilt_pos);
-            sscanf(content.c_str() + tilt_pos, ":%f", &point.tilt);
-            
-            entry.stroke_data[point_id] = point;
-            
-            // Find next point or end of stroke_data
-            point_start = content.find('}', tilt_pos);
-            if(point_start == std::string::npos) break;
-            point_start++;
-            if(content[point_start] == '}' || content[point_start] == ']') break;
+            if(key == "id") {
+                // Skip the id value
+                parseNumber(p);
+            } else if(key == "entry_text") {
+                entry.entry_text = parseString(p);
+                foundText = true;
+            } else if(key == "stroke_data") {
+                // Parse stroke_data object
+                if(*p != '{') {
+                    std::cerr << "Error: Expected '{' for stroke_data" << std::endl;
+                    break;
+                }
+                p++; // skip '{'
+                
+                while(*p && *p != '}') {
+                    skipWhitespace(p);
+                    if(*p == ',') { p++; continue; }
+                    if(*p != '"') break;
+                    
+                    // Parse point id
+                    std::string pointId = parseString(p);
+                    skipWhitespace(p);
+                    if(*p == ':') p++;
+                    skipWhitespace(p);
+                    
+                    if(*p != '{') break;
+                    p++; // skip '{'
+                    
+                    StrokePoint point;
+                    point.coordinates[0] = 0;
+                    point.coordinates[1] = 0;
+                    point.timestamp = 0;
+                    point.pressure = 0;
+                    point.tilt = 0;
+                    
+                    // Parse point properties
+                    while(*p && *p != '}') {
+                        skipWhitespace(p);
+                        if(*p == ',') { p++; continue; }
+                        if(*p != '"') break;
+                        
+                        std::string propKey = parseString(p);
+                        skipWhitespace(p);
+                        if(*p == ':') p++;
+                        skipWhitespace(p);
+                        
+                        if(propKey == "coordinates") {
+                            if(*p == '[') {
+                                p++;
+                                point.coordinates[0] = parseNumber(p);
+                                skipWhitespace(p);
+                                if(*p == ',') p++;
+                                point.coordinates[1] = parseNumber(p);
+                                skipWhitespace(p);
+                                if(*p == ']') p++;
+                            }
+                        } else if(propKey == "timestamp") {
+                            point.timestamp = parseNumber(p);
+                        } else if(propKey == "pressure") {
+                            point.pressure = parseNumber(p);
+                        } else if(propKey == "tilt") {
+                            point.tilt = parseNumber(p);
+                        }
+                    }
+                    
+                    if(*p == '}') p++; // end of point
+                    entry.stroke_data[pointId] = point;
+                    foundStroke = true;
+                }
+                
+                if(*p == '}') p++; // end of stroke_data
+            }
         }
         
-        entries.push_back(entry);
+        if(*p == '}') p++; // end of entry
         
-        // Find next entry
-        pos = content.find('}', pos);
-        if(pos == std::string::npos) break;
-        pos = content.find('{', pos + 1);
-        if(pos == std::string::npos) break;
+        if(foundText && foundStroke && !entry.stroke_data.empty()) {
+            entries.push_back(entry);
+            entryCount++;
+            if(entryCount % 100 == 0) {
+                std::cout << "Parsed " << entryCount << " entries..." << std::endl;
+            }
+        }
+    }
+    
+    std::cout << "Successfully parsed " << entries.size() << " entries" << std::endl;
+    
+    // Debug: print first entry stats
+    if(!entries.empty()) {
+        std::cout << "First entry text: \"" << entries[0].entry_text << "\"" << std::endl;
+        std::cout << "First entry has " << entries[0].stroke_data.size() << " stroke points" << std::endl;
+        
+        // Print sample point
+        if(!entries[0].stroke_data.empty()) {
+            auto it = entries[0].stroke_data.begin();
+            std::cout << "Sample point: coords=(" << it->second.coordinates[0] << ", " 
+                      << it->second.coordinates[1] << "), ts=" << it->second.timestamp << std::endl;
+        }
     }
     
     return entries;
@@ -115,4 +262,6 @@ void buildVocabulary(const std::vector<TrainingEntry>& entries,
         idx2char[idx] = c;
         idx++;
     }
+    
+    std::cout << "Built vocabulary with " << chars.size() << " unique characters" << std::endl;
 }

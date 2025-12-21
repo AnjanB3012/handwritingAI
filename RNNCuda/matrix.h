@@ -35,4 +35,15 @@ void fillMatrix(Matrix m, float value);
 void initMatrixRandom(Matrix m, float min_val, float max_val);
 void initMatrixXavier(Matrix m, int input_size);
 
+// Backward pass operations
+void sigmoidBackward(Matrix grad_out, Matrix sigmoid_output, Matrix grad_in);
+void tanhBackward(Matrix grad_out, Matrix tanh_output, Matrix grad_in);
+void reluBackward(Matrix grad_out, Matrix relu_input, Matrix grad_in);
+void matmulBackwardA(Matrix grad_out, Matrix B, Matrix grad_A);  // dL/dA = dL/dOut * B^T
+void matmulBackwardB(Matrix grad_out, Matrix A, Matrix grad_B);  // dL/dB = A^T * dL/dOut
+void transposeMatmul(Matrix A, Matrix B, Matrix outMat);  // A^T * B
+void matmulTranspose(Matrix A, Matrix B, Matrix outMat);  // A * B^T
+void addInplace(Matrix A, Matrix B);  // A += B
+void clipGradients(Matrix m, float max_norm);
+
 #endif

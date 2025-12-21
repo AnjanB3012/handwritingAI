@@ -38,6 +38,41 @@ void initTextConditionedLSTM(TextConditionedLSTM* model, int vocab_size, int emb
     fillMatrix(model->fc_b, 0.0f);
 }
 
+void initTextConditionedLSTMGradients(TextConditionedLSTM* model) {
+    // Embedding gradient
+    model->dembedding = createMatrix(model->vocab_size + 1, model->embed_dim);
+    fillMatrix(model->dembedding, 0.0f);
+    
+    // LSTM gradients
+    for(int i = 0; i < model->num_layers; i++) {
+        initLSTMCellGradients(&model->lstm_layer.cells[i]);
+    }
+    
+    // FC gradients
+    model->dfc_hidden_W = createMatrix(model->hidden_size / 2, model->hidden_size);
+    model->dfc_hidden_b = createMatrix(model->hidden_size / 2, 1);
+    model->dfc_W = createMatrix(model->output_size, model->hidden_size / 2);
+    model->dfc_b = createMatrix(model->output_size, 1);
+    
+    fillMatrix(model->dfc_hidden_W, 0.0f);
+    fillMatrix(model->dfc_hidden_b, 0.0f);
+    fillMatrix(model->dfc_W, 0.0f);
+    fillMatrix(model->dfc_b, 0.0f);
+}
+
+void zeroTextConditionedLSTMGradients(TextConditionedLSTM* model) {
+    fillMatrix(model->dembedding, 0.0f);
+    
+    for(int i = 0; i < model->num_layers; i++) {
+        zeroLSTMCellGradients(&model->lstm_layer.cells[i]);
+    }
+    
+    fillMatrix(model->dfc_hidden_W, 0.0f);
+    fillMatrix(model->dfc_hidden_b, 0.0f);
+    fillMatrix(model->dfc_W, 0.0f);
+    fillMatrix(model->dfc_b, 0.0f);
+}
+
 void initStartCoordDNN(StartCoordDNN* model, int vocab_size, int embed_dim,
                        std::vector<int> hidden_dims, int output_size) {
     model->vocab_size = vocab_size;
@@ -68,6 +103,287 @@ void initStartCoordDNN(StartCoordDNN* model, int vocab_size, int embed_dim,
     fillMatrix(b_out, 0.0f);
     model->layer_weights.push_back(W_out);
     model->layer_biases.push_back(b_out);
+}
+
+void initStartCoordDNNGradients(StartCoordDNN* model) {
+    model->dembedding = createMatrix(model->vocab_size + 1, model->embed_dim);
+    fillMatrix(model->dembedding, 0.0f);
+    
+    for(size_t i = 0; i < model->layer_weights.size(); i++) {
+        Matrix dW = createMatrix(model->layer_weights[i].rows, model->layer_weights[i].cols);
+        Matrix db = createMatrix(model->layer_biases[i].rows, 1);
+        fillMatrix(dW, 0.0f);
+        fillMatrix(db, 0.0f);
+        model->dlayer_weights.push_back(dW);
+        model->dlayer_biases.push_back(db);
+    }
+}
+
+void zeroStartCoordDNNGradients(StartCoordDNN* model) {
+    fillMatrix(model->dembedding, 0.0f);
+    for(size_t i = 0; i < model->dlayer_weights.size(); i++) {
+        fillMatrix(model->dlayer_weights[i], 0.0f);
+        fillMatrix(model->dlayer_biases[i], 0.0f);
+    }
+}
+
+void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_seq, int text_len,
+                                         Matrix* stroke_seq, int stroke_len, Matrix* output,
+                                         TextConditionedLSTMCache* cache) {
+    // Save text info for backprop
+    cache->text_seq = new int[text_len];
+    memcpy(cache->text_seq, text_seq, text_len * sizeof(int));
+    cache->text_len = text_len;
+    
+    // Embed text and compute context vector (average of embeddings)
+    Matrix text_emb = createMatrix(text_len, model->embed_dim);
+    int non_zero_count = 0;
+    
+    for(int i = 0; i < text_len; i++) {
+        if(text_seq[i] != 0) {
+            non_zero_count++;
+            // Copy embedding row
+            for(int j = 0; j < model->embed_dim; j++) {
+                text_emb.data[i * model->embed_dim + j] = 
+                    model->embedding.data[text_seq[i] * model->embed_dim + j];
+            }
+        }
+    }
+    
+    // Average embeddings (context vector)
+    cache->context = createMatrix(1, model->embed_dim);
+    fillMatrix(cache->context, 0.0f);
+    if(non_zero_count > 0) {
+        for(int i = 0; i < text_len; i++) {
+            if(text_seq[i] != 0) {
+                for(int j = 0; j < model->embed_dim; j++) {
+                    cache->context.data[j] += text_emb.data[i * model->embed_dim + j];
+                }
+            }
+        }
+        scale(cache->context, 1.0f / non_zero_count);
+    }
+    
+    // Process each timestep in stroke sequence
+    cache->lstm_caches.resize(stroke_len);
+    cache->fc1_inputs.resize(stroke_len);
+    cache->fc1_pre_relu.resize(stroke_len);
+    cache->fc1_outputs.resize(stroke_len);
+    cache->fc2_outputs.resize(stroke_len);
+    
+    Matrix h_prev = createMatrix(model->hidden_size, 1);
+    Matrix c_prev = createMatrix(model->hidden_size, 1);
+    fillMatrix(h_prev, 0.0f);
+    fillMatrix(c_prev, 0.0f);
+    
+    for(int t = 0; t < stroke_len; t++) {
+        // Concatenate stroke input with context
+        Matrix combined_input = createMatrix(model->input_size + model->embed_dim, 1);
+        for(int i = 0; i < model->input_size; i++) {
+            combined_input.data[i] = stroke_seq[t].data[i];
+        }
+        for(int i = 0; i < model->embed_dim; i++) {
+            combined_input.data[model->input_size + i] = cache->context.data[i];
+        }
+        
+        // LSTM forward with cache
+        Matrix h_new = createMatrix(model->hidden_size, 1);
+        Matrix c_new = createMatrix(model->hidden_size, 1);
+        lstmForwardWithCache(&model->lstm_layer.cells[0], combined_input, h_prev, c_prev, 
+                             &h_new, &c_new, &cache->lstm_caches[t]);
+        
+        // Save h for FC backprop
+        cache->fc1_inputs[t] = createMatrix(model->hidden_size, 1);
+        copyMatrix(h_new, cache->fc1_inputs[t]);
+        
+        // FC layers
+        Matrix fc1_pre = createMatrix(model->hidden_size / 2, 1);
+        matmul(model->fc_hidden_W, h_new, fc1_pre);
+        add(fc1_pre, model->fc_hidden_b, fc1_pre);
+        
+        // Save pre-ReLU for backprop
+        cache->fc1_pre_relu[t] = createMatrix(model->hidden_size / 2, 1);
+        copyMatrix(fc1_pre, cache->fc1_pre_relu[t]);
+        
+        // Apply ReLU
+        relu(fc1_pre);
+        cache->fc1_outputs[t] = createMatrix(model->hidden_size / 2, 1);
+        copyMatrix(fc1_pre, cache->fc1_outputs[t]);
+        
+        Matrix fc2_out = createMatrix(model->output_size, 1);
+        matmul(model->fc_W, fc1_pre, fc2_out);
+        add(fc2_out, model->fc_b, fc2_out);
+        
+        // Apply sigmoid only to finished (last dimension)
+        float finished_val = fc2_out.data[model->output_size - 1];
+        fc2_out.data[model->output_size - 1] = 1.0f / (1.0f + expf(-finished_val));
+        
+        cache->fc2_outputs[t] = createMatrix(model->output_size, 1);
+        copyMatrix(fc2_out, cache->fc2_outputs[t]);
+        
+        copyMatrix(h_new, h_prev);
+        copyMatrix(c_new, c_prev);
+        
+        freeMatrix(combined_input);
+        freeMatrix(h_new);
+        freeMatrix(c_new);
+        freeMatrix(fc1_pre);
+        freeMatrix(fc2_out);
+    }
+    
+    // Copy outputs
+    *output = createMatrix(stroke_len, model->output_size);
+    for(int t = 0; t < stroke_len; t++) {
+        for(int i = 0; i < model->output_size; i++) {
+            output->data[t * model->output_size + i] = cache->fc2_outputs[t].data[i];
+        }
+    }
+    
+    freeMatrix(text_emb);
+    freeMatrix(h_prev);
+    freeMatrix(c_prev);
+}
+
+void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTMCache* cache,
+                                 Matrix* target_seq, int seq_len, float* loss) {
+    // Compute loss and gradients
+    *loss = 0.0f;
+    
+    // Initialize gradients for BPTT
+    Matrix dh_next = createMatrix(model->hidden_size, 1);
+    Matrix dc_next = createMatrix(model->hidden_size, 1);
+    fillMatrix(dh_next, 0.0f);
+    fillMatrix(dc_next, 0.0f);
+    
+    // Backprop through time (reverse order)
+    for(int t = seq_len - 1; t >= 0; t--) {
+        // Compute output loss gradient (MSE for coords, BCE for finished)
+        Matrix dout = createMatrix(model->output_size, 1);
+        
+        for(int i = 0; i < model->output_size - 1; i++) {
+            // MSE gradient: 2 * (pred - target) / n
+            float diff = cache->fc2_outputs[t].data[i] - target_seq[t].data[i];
+            dout.data[i] = 2.0f * diff / (float)(model->output_size - 1);
+            *loss += diff * diff / (float)(model->output_size - 1);
+        }
+        
+        // BCE gradient for finished: pred - target (after sigmoid)
+        float pred_finished = cache->fc2_outputs[t].data[model->output_size - 1];
+        float target_finished = target_seq[t].data[model->output_size - 1];
+        // d/dx of BCE after sigmoid is just (pred - target)
+        dout.data[model->output_size - 1] = pred_finished - target_finished;
+        *loss += -target_finished * logf(pred_finished + 1e-8f) 
+                 - (1.0f - target_finished) * logf(1.0f - pred_finished + 1e-8f);
+        
+        // Backprop through fc2
+        // dfc_W += dout * fc1_output^T
+        Matrix dfc_W_temp = createMatrix(model->output_size, model->hidden_size / 2);
+        matmulTranspose(dout, cache->fc1_outputs[t], dfc_W_temp);
+        addInplace(model->dfc_W, dfc_W_temp);
+        addInplace(model->dfc_b, dout);
+        
+        // dfc1_out = fc_W^T * dout
+        Matrix dfc1_out = createMatrix(model->hidden_size / 2, 1);
+        transposeMatmul(model->fc_W, dout, dfc1_out);
+        
+        // Backprop through ReLU
+        Matrix dfc1_pre = createMatrix(model->hidden_size / 2, 1);
+        reluBackward(dfc1_out, cache->fc1_pre_relu[t], dfc1_pre);
+        
+        // Backprop through fc1
+        // dfc_hidden_W += dfc1_pre * h^T
+        Matrix dfc_hidden_W_temp = createMatrix(model->hidden_size / 2, model->hidden_size);
+        matmulTranspose(dfc1_pre, cache->fc1_inputs[t], dfc_hidden_W_temp);
+        addInplace(model->dfc_hidden_W, dfc_hidden_W_temp);
+        addInplace(model->dfc_hidden_b, dfc1_pre);
+        
+        // dh = fc_hidden_W^T * dfc1_pre + dh_next
+        Matrix dh = createMatrix(model->hidden_size, 1);
+        transposeMatmul(model->fc_hidden_W, dfc1_pre, dh);
+        addInplace(dh, dh_next);
+        
+        // Backprop through LSTM
+        Matrix dh_prev, dc_prev, dx;
+        lstmBackward(&model->lstm_layer.cells[0], &cache->lstm_caches[t], dh, dc_next,
+                     &dh_prev, &dc_prev, &dx);
+        
+        // Update dh_next and dc_next for next iteration
+        copyMatrix(dh_prev, dh_next);
+        copyMatrix(dc_prev, dc_next);
+        
+        // Backprop through context embedding (dx contains gradient for combined input)
+        // Last embed_dim elements of dx are gradients for context
+        for(int i = 0; i < cache->text_len; i++) {
+            int char_idx = cache->text_seq[i];
+            if(char_idx != 0) {
+                for(int j = 0; j < model->embed_dim; j++) {
+                    // Gradient is scaled by 1/non_zero_count from forward pass
+                    model->dembedding.data[char_idx * model->embed_dim + j] += 
+                        dx.data[model->input_size + j];
+                }
+            }
+        }
+        
+        // Cleanup
+        freeMatrix(dout);
+        freeMatrix(dfc_W_temp);
+        freeMatrix(dfc1_out);
+        freeMatrix(dfc1_pre);
+        freeMatrix(dfc_hidden_W_temp);
+        freeMatrix(dh);
+        freeMatrix(dh_prev);
+        freeMatrix(dc_prev);
+        freeMatrix(dx);
+    }
+    
+    *loss /= (float)seq_len;
+    
+    // Clip gradients
+    clipGradients(model->dfc_W, 5.0f);
+    clipGradients(model->dfc_b, 5.0f);
+    clipGradients(model->dfc_hidden_W, 5.0f);
+    clipGradients(model->dfc_hidden_b, 5.0f);
+    clipGradients(model->dembedding, 5.0f);
+    
+    freeMatrix(dh_next);
+    freeMatrix(dc_next);
+}
+
+void applyTextConditionedLSTMGradients(TextConditionedLSTM* model, float lr) {
+    // Apply LSTM gradients
+    for(int i = 0; i < model->num_layers; i++) {
+        applyLSTMGradients(&model->lstm_layer.cells[i], lr);
+    }
+    
+    // Apply FC gradients
+    scale(model->dfc_hidden_W, -lr);
+    addInplace(model->fc_hidden_W, model->dfc_hidden_W);
+    
+    scale(model->dfc_hidden_b, -lr);
+    addInplace(model->fc_hidden_b, model->dfc_hidden_b);
+    
+    scale(model->dfc_W, -lr);
+    addInplace(model->fc_W, model->dfc_W);
+    
+    scale(model->dfc_b, -lr);
+    addInplace(model->fc_b, model->dfc_b);
+    
+    // Apply embedding gradients
+    scale(model->dembedding, -lr);
+    addInplace(model->embedding, model->dembedding);
+}
+
+void applyStartCoordDNNGradients(StartCoordDNN* model, float lr) {
+    for(size_t i = 0; i < model->layer_weights.size(); i++) {
+        scale(model->dlayer_weights[i], -lr);
+        addInplace(model->layer_weights[i], model->dlayer_weights[i]);
+        
+        scale(model->dlayer_biases[i], -lr);
+        addInplace(model->layer_biases[i], model->dlayer_biases[i]);
+    }
+    
+    scale(model->dembedding, -lr);
+    addInplace(model->embedding, model->dembedding);
 }
 
 void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int text_len,
@@ -201,6 +517,23 @@ void startCoordDNNForward(StartCoordDNN* model, int first_char_idx, float* len_f
     if(model->layer_weights.size() > 1) freeMatrix(current);
     freeMatrix(char_emb);
     freeMatrix(input);
+}
+
+void freeTextConditionedLSTMCache(TextConditionedLSTMCache* cache) {
+    for(size_t t = 0; t < cache->lstm_caches.size(); t++) {
+        freeLSTMCache(&cache->lstm_caches[t]);
+        freeMatrix(cache->fc1_inputs[t]);
+        freeMatrix(cache->fc1_pre_relu[t]);
+        freeMatrix(cache->fc1_outputs[t]);
+        freeMatrix(cache->fc2_outputs[t]);
+    }
+    cache->lstm_caches.clear();
+    cache->fc1_inputs.clear();
+    cache->fc1_pre_relu.clear();
+    cache->fc1_outputs.clear();
+    cache->fc2_outputs.clear();
+    freeMatrix(cache->context);
+    delete[] cache->text_seq;
 }
 
 void freeTextConditionedLSTM(TextConditionedLSTM* model) {

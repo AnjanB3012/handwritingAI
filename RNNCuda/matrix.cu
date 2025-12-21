@@ -285,3 +285,164 @@ void initMatrixXavier(Matrix m, int input_size)
     initXavierKernel<<<blocks, threads>>>(m.data, scale, n, seed);
     cudaDeviceSynchronize();
 }
+
+// ============ BACKWARD PASS OPERATIONS ============
+
+__global__ void sigmoidBackwardKernel(const float* grad_out, const float* sig_out, float* grad_in, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)
+    {
+        // d(sigmoid)/dx = sigmoid(x) * (1 - sigmoid(x))
+        float s = sig_out[i];
+        grad_in[i] = grad_out[i] * s * (1.0f - s);
+    }
+}
+
+void sigmoidBackward(Matrix grad_out, Matrix sigmoid_output, Matrix grad_in)
+{
+    int n = grad_out.rows * grad_out.cols;
+    int threads = 128;
+    int blocks = (n+threads-1)/threads;
+    sigmoidBackwardKernel<<<blocks, threads>>>(grad_out.data, sigmoid_output.data, grad_in.data, n);
+    cudaDeviceSynchronize();
+}
+
+__global__ void tanhBackwardKernel(const float* grad_out, const float* tanh_out, float* grad_in, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)
+    {
+        // d(tanh)/dx = 1 - tanh(x)^2
+        float t = tanh_out[i];
+        grad_in[i] = grad_out[i] * (1.0f - t * t);
+    }
+}
+
+void tanhBackward(Matrix grad_out, Matrix tanh_output, Matrix grad_in)
+{
+    int n = grad_out.rows * grad_out.cols;
+    int threads = 128;
+    int blocks = (n+threads-1)/threads;
+    tanhBackwardKernel<<<blocks, threads>>>(grad_out.data, tanh_output.data, grad_in.data, n);
+    cudaDeviceSynchronize();
+}
+
+__global__ void reluBackwardKernel(const float* grad_out, const float* relu_in, float* grad_in, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)
+    {
+        grad_in[i] = (relu_in[i] > 0.0f) ? grad_out[i] : 0.0f;
+    }
+}
+
+void reluBackward(Matrix grad_out, Matrix relu_input, Matrix grad_in)
+{
+    int n = grad_out.rows * grad_out.cols;
+    int threads = 128;
+    int blocks = (n+threads-1)/threads;
+    reluBackwardKernel<<<blocks, threads>>>(grad_out.data, relu_input.data, grad_in.data, n);
+    cudaDeviceSynchronize();
+}
+
+// A^T * B -> outMat  (A is MxK, B is MxN, outMat is KxN)
+__global__ void transposeMatmulKernel(const float* A, const float* B, float* outMat, int M, int K, int N)
+{
+    int row = blockIdx.y*blockDim.y+threadIdx.y;  // row in output (0..K)
+    int col = blockIdx.x*blockDim.x+threadIdx.x;  // col in output (0..N)
+    if(row < K && col < N)
+    {
+        float val = 0.0f;
+        for(int i = 0; i < M; i++)
+        {
+            val += A[i*K + row] * B[i*N + col];  // A^T[row,i] * B[i,col]
+        }
+        outMat[row*N + col] = val;
+    }
+}
+
+void transposeMatmul(Matrix A, Matrix B, Matrix outMat)
+{
+    // A is MxK, B is MxN, output is KxN
+    dim3 threads(16,16);
+    dim3 blocks((B.cols+15)/16, (A.cols+15)/16);
+    transposeMatmulKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, A.rows, A.cols, B.cols);
+    cudaDeviceSynchronize();
+}
+
+// A * B^T -> outMat  (A is MxK, B is NxK, outMat is MxN)
+__global__ void matmulTransposeKernel(const float* A, const float* B, float* outMat, int M, int K, int N)
+{
+    int row = blockIdx.y*blockDim.y+threadIdx.y;  // row in output (0..M)
+    int col = blockIdx.x*blockDim.x+threadIdx.x;  // col in output (0..N)
+    if(row < M && col < N)
+    {
+        float val = 0.0f;
+        for(int i = 0; i < K; i++)
+        {
+            val += A[row*K + i] * B[col*K + i];  // A[row,i] * B^T[i,col] = A[row,i] * B[col,i]
+        }
+        outMat[row*N + col] = val;
+    }
+}
+
+void matmulTranspose(Matrix A, Matrix B, Matrix outMat)
+{
+    // A is MxK, B is NxK, output is MxN
+    dim3 threads(16,16);
+    dim3 blocks((B.rows+15)/16, (A.rows+15)/16);
+    matmulTransposeKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, A.rows, A.cols, B.rows);
+    cudaDeviceSynchronize();
+}
+
+// dL/dA = dL/dOut * B^T  (grad_out is MxN, B is KxN, grad_A is MxK)
+void matmulBackwardA(Matrix grad_out, Matrix B, Matrix grad_A)
+{
+    // grad_A = grad_out * B^T
+    matmulTranspose(grad_out, B, grad_A);
+}
+
+// dL/dB = A^T * dL/dOut  (A is MxK, grad_out is MxN, grad_B is KxN)
+void matmulBackwardB(Matrix grad_out, Matrix A, Matrix grad_B)
+{
+    // grad_B = A^T * grad_out
+    transposeMatmul(A, grad_out, grad_B);
+}
+
+__global__ void addInplaceKernel(float* A, const float* B, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)
+    {
+        A[i] += B[i];
+    }
+}
+
+void addInplace(Matrix A, Matrix B)
+{
+    int n = A.rows * A.cols;
+    int threads = 128;
+    int blocks = (n+threads-1)/threads;
+    addInplaceKernel<<<blocks, threads>>>(A.data, B.data, n);
+    cudaDeviceSynchronize();
+}
+
+__global__ void clipGradientsKernel(float* x, float max_norm, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)
+    {
+        if(x[i] > max_norm) x[i] = max_norm;
+        else if(x[i] < -max_norm) x[i] = -max_norm;
+    }
+}
+
+void clipGradients(Matrix m, float max_norm)
+{
+    int n = m.rows * m.cols;
+    int threads = 128;
+    int blocks = (n+threads-1)/threads;
+    clipGradientsKernel<<<blocks, threads>>>(m.data, max_norm, n);
+    cudaDeviceSynchronize();
+}
