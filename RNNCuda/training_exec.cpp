@@ -332,6 +332,7 @@ int main(int argc, char* argv[]) {
         epoch_timer.start();
         
         printf("\n--- Epoch %d/%d ---\n", epoch + 1, EPOCHS);
+        fflush(stdout);
         
         // Shuffle entries
         std::vector<int> indices(entries.size());
@@ -341,8 +342,14 @@ int main(int argc, char* argv[]) {
             std::swap(indices[i], indices[j]);
         }
         
+        printf("  Starting sample processing...\n");
+        fflush(stdout);
+        
         for(size_t idx = 0; idx < entries.size(); idx++) {
             const auto& entry = entries[indices[idx]];
+            
+            printf("  [DEBUG] Sample %zu: preparing...\n", idx + 1);
+            fflush(stdout);
             
             // Prepare training sample
             int* text_seq;
@@ -354,12 +361,20 @@ int main(int argc, char* argv[]) {
             if(!prepareTrainingSample(entry, char2idx, mean, std_dev,
                                       &text_seq, &text_len,
                                       &stroke_inputs, &stroke_targets, &stroke_len)) {
+                printf("  [DEBUG] Sample %zu: skipped\n", idx + 1);
+                fflush(stdout);
                 epoch_skipped++;
                 continue;
             }
             
+            printf("  [DEBUG] Sample %zu: seq_len=%d, text_len=%d, zeroing gradients...\n", idx + 1, stroke_len, text_len);
+            fflush(stdout);
+            
             // Zero gradients
             zeroTextConditionedLSTMGradients(&lstm_model);
+            
+            printf("  [DEBUG] Sample %zu: forward pass...\n", idx + 1);
+            fflush(stdout);
             
             // Forward pass with cache
             Matrix output;
@@ -367,12 +382,21 @@ int main(int argc, char* argv[]) {
             textConditionedLSTMForwardWithCache(&lstm_model, text_seq, text_len,
                                                 stroke_inputs, stroke_len, &output, &cache);
             
+            printf("  [DEBUG] Sample %zu: backward pass...\n", idx + 1);
+            fflush(stdout);
+            
             // Backward pass
             float sample_loss;
             textConditionedLSTMBackward(&lstm_model, &cache, stroke_targets, stroke_len, &sample_loss);
             
+            printf("  [DEBUG] Sample %zu: applying gradients, loss=%.4f...\n", idx + 1, sample_loss);
+            fflush(stdout);
+            
             // Apply gradients
             applyTextConditionedLSTMGradients(&lstm_model, LEARNING_RATE);
+            
+            printf("  [DEBUG] Sample %zu: done!\n", idx + 1);
+            fflush(stdout);
             
             epoch_loss += sample_loss;
             epoch_samples++;
