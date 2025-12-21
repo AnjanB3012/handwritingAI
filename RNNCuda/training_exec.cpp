@@ -12,7 +12,7 @@
 // Training parameters
 const int EPOCHS = 50;
 const float LEARNING_RATE = 0.001f;
-const int MAX_SEQ_LEN = 200;  // Truncate sequences longer than this
+const int MAX_SEQ_LEN = 50;  // Reduced from 200 for faster training
 
 // Timer helper using clock()
 class Timer {
@@ -285,8 +285,8 @@ int main(int argc, char* argv[]) {
     printf("Start coord std: [%.4f, %.4f]\n", start_coord_std[0], start_coord_std[1]);
     
     // Initialize models (smaller for faster training)
-    int hidden_size = 256;  // Reduced from 1024
-    int embed_dim = 64;     // Reduced from 256
+    int hidden_size = 128;  // Reduced for faster iteration
+    int embed_dim = 32;     // Reduced for faster iteration
     
     TextConditionedLSTM lstm_model;
     initTextConditionedLSTM(&lstm_model, vocab_size, embed_dim, 5, hidden_size, 1, 6);

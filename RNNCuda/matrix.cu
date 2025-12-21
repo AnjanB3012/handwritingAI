@@ -59,7 +59,7 @@ void matmul(Matrix A, Matrix B, Matrix outMat)
     dim3 threads(16,16);
     dim3 blocks((B.cols+15)/16, (A.rows+15)/16);
     matmulkernel<<<blocks, threads>>>(A.data, B.data, outMat.data, A.rows, B.cols, A.cols);
-    cudaDeviceSynchronize();
+    // Removed sync for performance - operations are serialized in default stream
 }
 
 __global__ void addkernel(float* A, float* B, float* outMat, int n)
@@ -77,7 +77,6 @@ void add(Matrix A, Matrix B, Matrix outMat)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     addkernel<<<blocks, threads>>>(A.data, B.data, outMat.data, n);
-    cudaDeviceSynchronize();
 }
 
 Matrix loadMatrix(float* data, int row, int col)
@@ -136,7 +135,7 @@ void sigmoid(Matrix m)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     sigmoidKernel<<<blocks, threads>>>(m.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 void tanhInplace(Matrix m)
@@ -145,7 +144,7 @@ void tanhInplace(Matrix m)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     tanhKernel<<<blocks, threads>>>(m.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 void hadamard(Matrix A, Matrix B, Matrix outMat)
@@ -154,7 +153,7 @@ void hadamard(Matrix A, Matrix B, Matrix outMat)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     hadamardKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 void copyMatrix(Matrix src, Matrix dest)
@@ -163,7 +162,7 @@ void copyMatrix(Matrix src, Matrix dest)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     copyKernel<<<blocks, threads>>>(src.data, dest.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void reluKernel(float* x, int n)
@@ -181,7 +180,7 @@ void relu(Matrix m)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     reluKernel<<<blocks, threads>>>(m.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void subtractKernel(const float* A, const float* B, float* outMat, int n)
@@ -199,7 +198,7 @@ void subtract(Matrix A, Matrix B, Matrix outMat)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     subtractKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void scaleKernel(float* x, float scalar, int n)
@@ -217,7 +216,7 @@ void scale(Matrix m, float scalar)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     scaleKernel<<<blocks, threads>>>(m.data, scalar, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void fillKernel(float* x, float value, int n)
@@ -235,7 +234,7 @@ void fillMatrix(Matrix m, float value)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     fillKernel<<<blocks, threads>>>(m.data, value, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void initRandomKernel(float* x, float min_val, float max_val, int n, unsigned int seed)
@@ -257,7 +256,7 @@ void initMatrixRandom(Matrix m, float min_val, float max_val)
     int blocks = (n+threads-1)/threads;
     unsigned int seed = (unsigned int)time(NULL);
     initRandomKernel<<<blocks, threads>>>(m.data, min_val, max_val, n, seed);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void initXavierKernel(float* x, float scale, int n, unsigned int seed)
@@ -283,7 +282,7 @@ void initMatrixXavier(Matrix m, int input_size)
     float scale = sqrtf(2.0f / (float)input_size);
     unsigned int seed = (unsigned int)time(NULL);
     initXavierKernel<<<blocks, threads>>>(m.data, scale, n, seed);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 // ============ BACKWARD PASS OPERATIONS ============
@@ -305,7 +304,7 @@ void sigmoidBackward(Matrix grad_out, Matrix sigmoid_output, Matrix grad_in)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     sigmoidBackwardKernel<<<blocks, threads>>>(grad_out.data, sigmoid_output.data, grad_in.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void tanhBackwardKernel(const float* grad_out, const float* tanh_out, float* grad_in, int n)
@@ -325,7 +324,7 @@ void tanhBackward(Matrix grad_out, Matrix tanh_output, Matrix grad_in)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     tanhBackwardKernel<<<blocks, threads>>>(grad_out.data, tanh_output.data, grad_in.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void reluBackwardKernel(const float* grad_out, const float* relu_in, float* grad_in, int n)
@@ -343,7 +342,7 @@ void reluBackward(Matrix grad_out, Matrix relu_input, Matrix grad_in)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     reluBackwardKernel<<<blocks, threads>>>(grad_out.data, relu_input.data, grad_in.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 // A^T * B -> outMat  (A is MxK, B is MxN, outMat is KxN)
@@ -368,7 +367,7 @@ void transposeMatmul(Matrix A, Matrix B, Matrix outMat)
     dim3 threads(16,16);
     dim3 blocks((B.cols+15)/16, (A.cols+15)/16);
     transposeMatmulKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, A.rows, A.cols, B.cols);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 // A * B^T -> outMat  (A is MxK, B is NxK, outMat is MxN)
@@ -393,7 +392,7 @@ void matmulTranspose(Matrix A, Matrix B, Matrix outMat)
     dim3 threads(16,16);
     dim3 blocks((B.rows+15)/16, (A.rows+15)/16);
     matmulTransposeKernel<<<blocks, threads>>>(A.data, B.data, outMat.data, A.rows, A.cols, B.rows);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 // dL/dA = dL/dOut * B^T  (grad_out is MxN, B is KxN, grad_A is MxK)
@@ -425,7 +424,7 @@ void addInplace(Matrix A, Matrix B)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     addInplaceKernel<<<blocks, threads>>>(A.data, B.data, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
 
 __global__ void clipGradientsKernel(float* x, float max_norm, int n)
@@ -444,5 +443,5 @@ void clipGradients(Matrix m, float max_norm)
     int threads = 128;
     int blocks = (n+threads-1)/threads;
     clipGradientsKernel<<<blocks, threads>>>(m.data, max_norm, n);
-    cudaDeviceSynchronize();
+    // sync removed for perf
 }
