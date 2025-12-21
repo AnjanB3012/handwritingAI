@@ -8,11 +8,53 @@
 #include <cstring>
 #include <ctime>
 #include <cstdlib>
+#include <chrono>
+#include <iomanip>
 
 // Training parameters
 const int EPOCHS = 50;
 const float LEARNING_RATE = 0.001f;
 const int MAX_SEQ_LEN = 200;  // Truncate sequences longer than this
+
+// Timer helper
+class Timer {
+public:
+    std::chrono::high_resolution_clock::time_point start_time;
+    
+    void start() {
+        start_time = std::chrono::high_resolution_clock::now();
+    }
+    
+    double elapsed_seconds() {
+        auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(now - start_time).count();
+    }
+    
+    std::string format_time(double seconds) {
+        int hrs = (int)(seconds / 3600);
+        int mins = (int)((seconds - hrs * 3600) / 60);
+        int secs = (int)(seconds - hrs * 3600 - mins * 60);
+        
+        std::ostringstream oss;
+        if(hrs > 0) oss << hrs << "h ";
+        if(mins > 0 || hrs > 0) oss << mins << "m ";
+        oss << secs << "s";
+        return oss.str();
+    }
+};
+
+void print_progress_bar(int current, int total, int width = 30) {
+    float progress = (float)current / total;
+    int filled = (int)(progress * width);
+    
+    std::cout << "[";
+    for(int i = 0; i < width; i++) {
+        if(i < filled) std::cout << "=";
+        else if(i == filled) std::cout << ">";
+        else std::cout << " ";
+    }
+    std::cout << "] " << std::fixed << std::setprecision(1) << (progress * 100) << "%";
+}
 
 // Compute normalization statistics
 void computeStats(const std::vector<TrainingEntry>& entries,
@@ -256,17 +298,41 @@ int main(int argc, char* argv[]) {
     initStartCoordDNN(&dnn_model, vocab_size, 16, hidden_dims, 2);
     initStartCoordDNNGradients(&dnn_model);
     
-    std::cout << "Models initialized. Starting training..." << std::endl;
-    std::cout << "LSTM: vocab=" << vocab_size << ", embed=" << embed_dim 
-              << ", hidden=" << hidden_size << std::endl;
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "       TRAINING CONFIGURATION" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "LSTM Model:" << std::endl;
+    std::cout << "  - Vocabulary size: " << vocab_size << std::endl;
+    std::cout << "  - Embedding dim:   " << embed_dim << std::endl;
+    std::cout << "  - Hidden size:     " << hidden_size << std::endl;
+    std::cout << "  - Input size:      5 (dx, dy, dt, pressure, tilt)" << std::endl;
+    std::cout << "  - Output size:     6 (dx, dy, dt, pressure, tilt, finished)" << std::endl;
+    std::cout << "\nTraining params:" << std::endl;
+    std::cout << "  - Epochs:          " << EPOCHS << std::endl;
+    std::cout << "  - Learning rate:   " << LEARNING_RATE << std::endl;
+    std::cout << "  - Max seq length:  " << MAX_SEQ_LEN << std::endl;
+    std::cout << "  - Training samples: " << entries.size() << std::endl;
+    std::cout << "========================================\n" << std::endl;
     
     // Training loop
     float best_loss = 1e10f;
     int samples_trained = 0;
+    Timer total_timer, epoch_timer;
+    total_timer.start();
+    
+    // Track running stats
+    float running_loss = 0.0f;
+    int running_count = 0;
+    const int RUNNING_WINDOW = 20;
     
     for(int epoch = 0; epoch < EPOCHS; epoch++) {
         float epoch_loss = 0.0f;
         int epoch_samples = 0;
+        int epoch_skipped = 0;
+        int total_stroke_points = 0;
+        epoch_timer.start();
+        
+        std::cout << "\n--- Epoch " << (epoch + 1) << "/" << EPOCHS << " ---" << std::endl;
         
         // Shuffle entries
         std::vector<int> indices(entries.size());
@@ -289,6 +355,7 @@ int main(int argc, char* argv[]) {
             if(!prepareTrainingSample(entry, char2idx, mean, std_dev,
                                       &text_seq, &text_len,
                                       &stroke_inputs, &stroke_targets, &stroke_len)) {
+                epoch_skipped++;
                 continue;
             }
             
@@ -311,30 +378,64 @@ int main(int argc, char* argv[]) {
             epoch_loss += sample_loss;
             epoch_samples++;
             samples_trained++;
+            total_stroke_points += stroke_len;
+            
+            // Update running loss
+            running_loss = (running_loss * running_count + sample_loss) / (running_count + 1);
+            running_count = std::min(running_count + 1, RUNNING_WINDOW);
             
             // Cleanup
             freeMatrix(output);
             freeTextConditionedLSTMCache(&cache);
             freeTrainingSample(text_seq, stroke_inputs, stroke_targets, stroke_len);
             
-            // Progress update
-            if(samples_trained % 50 == 0) {
-                std::cout << "  Epoch " << (epoch + 1) << "/" << EPOCHS 
-                          << " Sample " << epoch_samples << "/" << entries.size()
-                          << " Loss: " << (epoch_loss / epoch_samples) << std::endl;
+            // Detailed progress update every 10 samples
+            if(epoch_samples % 10 == 0 || idx == entries.size() - 1) {
+                double elapsed = epoch_timer.elapsed_seconds();
+                double samples_per_sec = epoch_samples / elapsed;
+                int remaining_samples = entries.size() - idx - 1;
+                double eta_seconds = remaining_samples / samples_per_sec;
+                
+                std::cout << "\r  ";
+                print_progress_bar(idx + 1, entries.size());
+                std::cout << " | Loss: " << std::fixed << std::setprecision(4) << running_loss
+                          << " | " << std::setprecision(1) << samples_per_sec << " samples/s"
+                          << " | ETA: " << epoch_timer.format_time(eta_seconds)
+                          << "    " << std::flush;
             }
         }
         
+        std::cout << std::endl;  // New line after progress bar
+        
+        double epoch_time = epoch_timer.elapsed_seconds();
+        
         if(epoch_samples > 0) {
             float avg_loss = epoch_loss / epoch_samples;
-            std::cout << "Epoch " << (epoch + 1) << "/" << EPOCHS 
-                      << " - Avg Loss: " << avg_loss 
-                      << " (samples: " << epoch_samples << ")" << std::endl;
+            float loss_improvement = (best_loss - avg_loss) / best_loss * 100;
+            
+            std::cout << "\n  Epoch Summary:" << std::endl;
+            std::cout << "    - Samples trained:  " << epoch_samples 
+                      << " (skipped: " << epoch_skipped << ")" << std::endl;
+            std::cout << "    - Stroke points:    " << total_stroke_points << std::endl;
+            std::cout << "    - Average loss:     " << std::fixed << std::setprecision(6) << avg_loss << std::endl;
+            std::cout << "    - Best loss so far: " << best_loss << std::endl;
+            std::cout << "    - Epoch time:       " << epoch_timer.format_time(epoch_time) << std::endl;
+            std::cout << "    - Total time:       " << total_timer.format_time(total_timer.elapsed_seconds()) << std::endl;
+            
+            // Estimate remaining time
+            double avg_epoch_time = total_timer.elapsed_seconds() / (epoch + 1);
+            double remaining_time = avg_epoch_time * (EPOCHS - epoch - 1);
+            std::cout << "    - Est. remaining:   " << total_timer.format_time(remaining_time) << std::endl;
             
             // Save best model
             if(avg_loss < best_loss) {
+                loss_improvement = (best_loss - avg_loss) / best_loss * 100;
                 best_loss = avg_loss;
-                std::cout << "  New best loss! Saving checkpoint..." << std::endl;
+                std::cout << "\n  *** NEW BEST LOSS! ";
+                if(best_loss < 1e9f) {
+                    std::cout << "(improved by " << std::setprecision(2) << loss_improvement << "%) ";
+                }
+                std::cout << "Saving checkpoint... ***" << std::endl;
                 
                 // Prepare char2idx arrays for saving
                 int* char2idx_keys = new int[vocab_size];
@@ -351,12 +452,21 @@ int main(int argc, char* argv[]) {
                 
                 delete[] char2idx_keys;
                 delete[] char2idx_values;
+                
+                std::cout << "    Saved to: " << output_file << std::endl;
             }
         }
     }
     
-    std::cout << "Training complete! Best loss: " << best_loss << std::endl;
-    std::cout << "Model saved to " << output_file << std::endl;
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "        TRAINING COMPLETE!" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Final Statistics:" << std::endl;
+    std::cout << "  - Total samples trained: " << samples_trained << std::endl;
+    std::cout << "  - Best loss achieved:    " << std::fixed << std::setprecision(6) << best_loss << std::endl;
+    std::cout << "  - Total training time:   " << total_timer.format_time(total_timer.elapsed_seconds()) << std::endl;
+    std::cout << "  - Model saved to:        " << output_file << std::endl;
+    std::cout << "========================================\n" << std::endl;
     
     // Cleanup
     freeTextConditionedLSTM(&lstm_model);
