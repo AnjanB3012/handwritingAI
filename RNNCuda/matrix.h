@@ -34,3 +34,5 @@ void scale(Matrix m, float scalar);
 void fillMatrix(Matrix m, float value);
 void initMatrixRandom(Matrix m, float min_val, float max_val);
 void initMatrixXavier(Matrix m, int input_size);
+
+#endif
