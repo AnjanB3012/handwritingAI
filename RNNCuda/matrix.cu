@@ -121,7 +121,7 @@ __global__ void hadamardKernel(const float* A, const float* B, float* C, int n)
     }
 }
 
-__global__ void copyKernel(const float* src, const float* dest, int n)
+__global__ void copyKernel(const float* src, float* dest, int n)
 {
     int i = blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n)
