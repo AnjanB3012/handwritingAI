@@ -35,9 +35,9 @@ $(LSTM_OBJ): $(LSTM_SRC) lstm.h matrix.h
 $(MODELS_OBJ): $(MODELS_SRC) models.h lstm.h matrix.h
 	$(NVCC) $(NVCCFLAGS) -c $(MODELS_SRC) -o $(MODELS_OBJ)
 
-# Compile C++ files
+# Compile C++ files (use NVCC to ensure compatible object format on Windows)
 $(JSON_PARSER_OBJ): $(JSON_PARSER_SRC) json_parser.h
-	$(CXX) $(CXXFLAGS) -c $(JSON_PARSER_SRC) -o $(JSON_PARSER_OBJ)
+	$(NVCC) $(NVCCFLAGS) -c $(JSON_PARSER_SRC) -o $(JSON_PARSER_OBJ)
 
 # Link training executable
 $(TRAINING_EXEC): $(TRAINING_SRC) $(MATRIX_OBJ) $(LSTM_OBJ) $(MODELS_OBJ) $(JSON_PARSER_OBJ)
