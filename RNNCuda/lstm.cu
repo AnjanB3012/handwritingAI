@@ -183,7 +183,8 @@ void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_ne
     // dL/dc_t (from h_t) = dL/dh_t * o_t * (1 - tanh(c_t)^2)
     Matrix dc_from_h = createMatrix(hidden_size, 1);
     Matrix one_minus_tanh_sq = createMatrix(hidden_size, 1);
-    cudaDeviceSynchronize();  // Sync before CPU read from GPU memory
+    CUDA_CHECK(cudaDeviceSynchronize());  // Sync before CPU read from GPU memory
+    CUDA_CHECK_LAST();
     for(int i = 0; i < hidden_size; i++) {
         float t = cache->c_tanh.data[i];
         one_minus_tanh_sq.data[i] = 1.0f - t * t;

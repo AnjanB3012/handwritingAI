@@ -232,7 +232,8 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     }
     
     // Sync before reading GPU data on CPU
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
     
     // Copy outputs
     *output = createMatrix(stroke_len, model->output_size);
@@ -349,7 +350,8 @@ void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTM
     clipGradients(model->dembedding, 5.0f);
     
     // Sync before cleanup
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
     
     freeMatrix(dh_next);
     freeMatrix(dc_next);
@@ -379,7 +381,8 @@ void applyTextConditionedLSTMGradients(TextConditionedLSTM* model, float lr) {
     addInplace(model->embedding, model->dembedding);
     
     // Sync after gradient application
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
 }
 
 void applyStartCoordDNNGradients(StartCoordDNN* model, float lr) {
@@ -476,7 +479,8 @@ void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int t
     }
     
     // Sync before reading GPU data on CPU
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
     
     // Copy outputs
     *output = createMatrix(stroke_len, model->output_size);
