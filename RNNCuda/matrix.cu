@@ -18,7 +18,11 @@ Matrix createMatrix(int row, int col)
     Matrix m;
     m.rows = row;
     m.cols = col;
-    cudaMallocManaged(&m.data, row*col*sizeof(float));
+    cudaError_t err = cudaMallocManaged(&m.data, row*col*sizeof(float));
+    if(err != cudaSuccess) {
+        fprintf(stderr, "CUDA malloc failed for %dx%d matrix: %s\n", row, col, cudaGetErrorString(err));
+        m.data = NULL;
+    }
     return m;
 }
 

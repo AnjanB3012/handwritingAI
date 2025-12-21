@@ -130,17 +130,34 @@ void zeroStartCoordDNNGradients(StartCoordDNN* model) {
 void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_seq, int text_len,
                                          Matrix* stroke_seq, int stroke_len, Matrix* output,
                                          TextConditionedLSTMCache* cache) {
+    printf("    [FWD] Starting forward pass, text_len=%d, stroke_len=%d\n", text_len, stroke_len);
+    fflush(stdout);
+    
     // Save text info for backprop
     cache->text_seq = new int[text_len];
     memcpy(cache->text_seq, text_seq, text_len * sizeof(int));
     cache->text_len = text_len;
     
+    printf("    [FWD] Syncing before embedding access...\n");
+    fflush(stdout);
+    
     // Sync before CPU access to GPU memory (embedding was initialized with GPU kernel)
     CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
+    
+    printf("    [FWD] Creating text_emb matrix (%d x %d)...\n", text_len, model->embed_dim);
+    fflush(stdout);
     
     // Embed text and compute context vector (average of embeddings)
     Matrix text_emb = createMatrix(text_len, model->embed_dim);
+    if(text_emb.data == NULL) {
+        fprintf(stderr, "ERROR: Failed to allocate text_emb!\n");
+        return;
+    }
     int non_zero_count = 0;
+    
+    printf("    [FWD] Copying embeddings...\n");
+    fflush(stdout);
     
     for(int i = 0; i < text_len; i++) {
         if(text_seq[i] != 0) {
@@ -153,12 +170,20 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
         }
     }
     
+    printf("    [FWD] Creating context vector, non_zero_count=%d...\n", non_zero_count);
+    fflush(stdout);
+    
     // Average embeddings (context vector)
     cache->context = createMatrix(1, model->embed_dim);
+    if(cache->context.data == NULL) {
+        fprintf(stderr, "ERROR: Failed to allocate context!\n");
+        return;
+    }
     fillMatrix(cache->context, 0.0f);
     
     // Sync before CPU writes to context (fillMatrix is a GPU kernel)
     CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
     
     if(non_zero_count > 0) {
         for(int i = 0; i < text_len; i++) {
@@ -171,6 +196,9 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
         scale(cache->context, 1.0f / non_zero_count);
     }
     
+    printf("    [FWD] Initializing caches and hidden states...\n");
+    fflush(stdout);
+    
     // Process each timestep in stroke sequence
     cache->lstm_caches.resize(stroke_len);
     cache->fc1_inputs.resize(stroke_len);
@@ -180,15 +208,32 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     
     Matrix h_prev = createMatrix(model->hidden_size, 1);
     Matrix c_prev = createMatrix(model->hidden_size, 1);
+    if(h_prev.data == NULL || c_prev.data == NULL) {
+        fprintf(stderr, "ERROR: Failed to allocate h_prev or c_prev!\n");
+        return;
+    }
     fillMatrix(h_prev, 0.0f);
     fillMatrix(c_prev, 0.0f);
     
     // Sync before CPU reads stroke_seq and context data in the loop
     CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_LAST();
+    
+    printf("    [FWD] Starting timestep loop...\n");
+    fflush(stdout);
     
     for(int t = 0; t < stroke_len; t++) {
+        if(t == 0 || t == stroke_len - 1) {
+            printf("    [FWD] Timestep %d/%d...\n", t, stroke_len);
+            fflush(stdout);
+        }
+        
         // Concatenate stroke input with context
         Matrix combined_input = createMatrix(model->input_size + model->embed_dim, 1);
+        if(combined_input.data == NULL) {
+            fprintf(stderr, "ERROR: Failed to allocate combined_input at t=%d!\n", t);
+            return;
+        }
         for(int i = 0; i < model->input_size; i++) {
             combined_input.data[i] = stroke_seq[t].data[i];
         }
@@ -199,8 +244,21 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
         // LSTM forward with cache
         Matrix h_new = createMatrix(model->hidden_size, 1);
         Matrix c_new = createMatrix(model->hidden_size, 1);
+        if(h_new.data == NULL || c_new.data == NULL) {
+            fprintf(stderr, "ERROR: Failed to allocate h_new or c_new at t=%d!\n", t);
+            return;
+        }
+        
+        if(t == 0) {
+            printf("    [FWD] Calling lstmForwardWithCache for t=0...\n");
+            fflush(stdout);
+        }
         lstmForwardWithCache(&model->lstm_layer.cells[0], combined_input, h_prev, c_prev, 
                              &h_new, &c_new, &cache->lstm_caches[t]);
+        if(t == 0) {
+            printf("    [FWD] lstmForwardWithCache returned for t=0\n");
+            fflush(stdout);
+        }
         
         // Save h for FC backprop
         cache->fc1_inputs[t] = createMatrix(model->hidden_size, 1);
