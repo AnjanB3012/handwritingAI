@@ -151,10 +151,16 @@ bool prepareTrainingSample(const TrainingEntry& entry,
                            int** text_seq, int* text_len,
                            Matrix** stroke_inputs, Matrix** stroke_targets, int* stroke_len) {
     
+    printf("    [PREP] Checking entry size: %zu\n", entry.stroke_data.size());
+    fflush(stdout);
+    
     if(entry.stroke_data.size() < 3) return false;
     
     // Encode text
     *text_len = entry.entry_text.length();
+    printf("    [PREP] Encoding text, len=%d\n", *text_len);
+    fflush(stdout);
+    
     *text_seq = new int[*text_len];
     for(int i = 0; i < *text_len; i++) {
         auto it = char2idx.find(entry.entry_text[i]);
@@ -164,6 +170,9 @@ bool prepareTrainingSample(const TrainingEntry& entry,
             (*text_seq)[i] = 0;  // Unknown char -> padding
         }
     }
+    
+    printf("    [PREP] Sorting stroke points\n");
+    fflush(stdout);
     
     // Sort stroke points by timestamp
     std::vector<std::pair<std::string, StrokePoint>> sorted_points;
@@ -177,18 +186,27 @@ bool prepareTrainingSample(const TrainingEntry& entry,
     
     // Limit sequence length
     int seq_len = std::min((int)sorted_points.size() - 1, MAX_SEQ_LEN);
+    printf("    [PREP] seq_len=%d\n", seq_len);
+    fflush(stdout);
+    
     if(seq_len < 2) {
         delete[] *text_seq;
         return false;
     }
     
     *stroke_len = seq_len;
+    printf("    [PREP] Allocating %d matrices\n", seq_len);
+    fflush(stdout);
+    
     *stroke_inputs = new Matrix[seq_len];
     *stroke_targets = new Matrix[seq_len];
     
     float prev_x = sorted_points[0].second.coordinates[0];
     float prev_y = sorted_points[0].second.coordinates[1];
     float prev_t = sorted_points[0].second.timestamp;
+    
+    printf("    [PREP] Creating input/target matrices...\n");
+    fflush(stdout);
     
     for(int i = 0; i < seq_len; i++) {
         const auto& curr = sorted_points[i + 1].second;
@@ -205,6 +223,10 @@ bool prepareTrainingSample(const TrainingEntry& entry,
         
         // Input: current state (use zeros for first, then previous output)
         (*stroke_inputs)[i] = createMatrix(5, 1);
+        
+        // Need to sync before CPU write to unified memory
+        cudaDeviceSynchronize();
+        
         if(i == 0) {
             fillMatrix((*stroke_inputs)[i], 0.0f);
         } else {
@@ -222,6 +244,8 @@ bool prepareTrainingSample(const TrainingEntry& entry,
         
         // Target: next deltas
         (*stroke_targets)[i] = createMatrix(6, 1);
+        cudaDeviceSynchronize();
+        
         (*stroke_targets)[i].data[0] = dx_norm;
         (*stroke_targets)[i].data[1] = dy_norm;
         (*stroke_targets)[i].data[2] = dt_norm;
@@ -233,6 +257,9 @@ bool prepareTrainingSample(const TrainingEntry& entry,
         prev_y = curr.coordinates[1];
         prev_t = curr.timestamp;
     }
+    
+    printf("    [PREP] Done creating matrices\n");
+    fflush(stdout);
     
     return true;
 }
