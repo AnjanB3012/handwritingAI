@@ -64,6 +64,10 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     std::vector<Matrix> stroke_seq;
     Matrix initial = createMatrix(5, 1);
     fillMatrix(initial, 0.0f);
+    
+    // Sync before CPU writes to GPU memory
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Normalize initial point
     initial.data[0] = (0.0f - mean[0]) / std[0];
     initial.data[1] = (0.0f - mean[1]) / std[1];

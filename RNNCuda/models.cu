@@ -135,6 +135,9 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     memcpy(cache->text_seq, text_seq, text_len * sizeof(int));
     cache->text_len = text_len;
     
+    // Sync before CPU access to GPU memory (embedding was initialized with GPU kernel)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Embed text and compute context vector (average of embeddings)
     Matrix text_emb = createMatrix(text_len, model->embed_dim);
     int non_zero_count = 0;
@@ -153,6 +156,10 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     // Average embeddings (context vector)
     cache->context = createMatrix(1, model->embed_dim);
     fillMatrix(cache->context, 0.0f);
+    
+    // Sync before CPU writes to context (fillMatrix is a GPU kernel)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     if(non_zero_count > 0) {
         for(int i = 0; i < text_len; i++) {
             if(text_seq[i] != 0) {
@@ -175,6 +182,9 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     Matrix c_prev = createMatrix(model->hidden_size, 1);
     fillMatrix(h_prev, 0.0f);
     fillMatrix(c_prev, 0.0f);
+    
+    // Sync before CPU reads stroke_seq and context data in the loop
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     for(int t = 0; t < stroke_len; t++) {
         // Concatenate stroke input with context
@@ -213,6 +223,9 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
         Matrix fc2_out = createMatrix(model->output_size, 1);
         matmul(model->fc_W, fc1_pre, fc2_out);
         add(fc2_out, model->fc_b, fc2_out);
+        
+        // Sync before CPU reads/writes fc2_out data
+        CUDA_CHECK(cudaDeviceSynchronize());
         
         // Apply sigmoid only to finished (last dimension)
         float finished_val = fc2_out.data[model->output_size - 1];
@@ -258,6 +271,9 @@ void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTM
     Matrix dc_next = createMatrix(model->hidden_size, 1);
     fillMatrix(dh_next, 0.0f);
     fillMatrix(dc_next, 0.0f);
+    
+    // Sync before CPU reads from cache and target_seq (GPU kernels may still be running)
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     // Backprop through time (reverse order)
     for(int t = seq_len - 1; t >= 0; t--) {
@@ -400,6 +416,9 @@ void applyStartCoordDNNGradients(StartCoordDNN* model, float lr) {
 
 void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int text_len,
                                 Matrix* stroke_seq, int stroke_len, Matrix* output) {
+    // Sync before CPU access to GPU memory (embedding was initialized with GPU kernel)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Embed text and compute context vector (average of embeddings)
     Matrix text_emb = createMatrix(text_len, model->embed_dim);
     int non_zero_count = 0;
@@ -418,6 +437,10 @@ void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int t
     // Average embeddings (context vector)
     Matrix context = createMatrix(1, model->embed_dim);
     fillMatrix(context, 0.0f);
+    
+    // Sync before CPU writes to context (fillMatrix is a GPU kernel)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     if(non_zero_count > 0) {
         for(int i = 0; i < text_len; i++) {
             if(text_seq[i] != 0) {
@@ -435,6 +458,9 @@ void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int t
     Matrix c_prev = createMatrix(model->hidden_size, 1);
     fillMatrix(h_prev, 0.0f);
     fillMatrix(c_prev, 0.0f);
+    
+    // Sync before CPU reads stroke_seq and context data in the loop
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     for(int t = 0; t < stroke_len; t++) {
         // Concatenate stroke input with context
@@ -460,6 +486,9 @@ void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int t
         Matrix fc2_out = createMatrix(model->output_size, 1);
         matmul(model->fc_W, fc1_out, fc2_out);
         add(fc2_out, model->fc_b, fc2_out);
+        
+        // Sync before CPU reads/writes fc2_out data
+        CUDA_CHECK(cudaDeviceSynchronize());
         
         // Apply sigmoid only to finished (last dimension)
         // First 5 dims: [dx, dy, dt, pressure, tilt] - no sigmoid
@@ -499,6 +528,9 @@ void textConditionedLSTMForward(TextConditionedLSTM* model, int* text_seq, int t
 }
 
 void startCoordDNNForward(StartCoordDNN* model, int first_char_idx, float* len_features, Matrix* output) {
+    // Sync before CPU reads embedding (GPU kernels may have written to it)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Embed first character
     Matrix char_emb = createMatrix(1, model->embed_dim);
     for(int i = 0; i < model->embed_dim; i++) {
