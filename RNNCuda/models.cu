@@ -622,6 +622,9 @@ void freeStartCoordDNN(StartCoordDNN* model) {
 void saveModels(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
                 const char* filename, float* mean, float* std, float* start_coord_mean,
                 float* start_coord_std, int* char2idx_keys, int* char2idx_values, int vocab_size) {
+    // Sync before reading GPU memory with fwrite
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     FILE* f = fopen(filename, "wb");
     if(!f) {
         fprintf(stderr, "Error: Cannot open file %s for writing\n", filename);
@@ -717,6 +720,7 @@ void loadModels(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     
     // Allocate and read embedding
     lstm_model->embedding = createMatrix(*vocab_size + 1, lstm_model->embed_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());  // Sync before CPU writes to GPU memory
     fread(lstm_model->embedding.data, sizeof(float), (*vocab_size + 1) * lstm_model->embed_dim, f);
     
     // Initialize LSTM layer
@@ -728,6 +732,7 @@ void loadModels(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     // Read LSTM weights
     LSTMCell* cell = &lstm_model->lstm_layer.cells[0];
     initLSTMCell(cell, lstm_model->input_size + lstm_model->embed_dim, lstm_model->hidden_size);
+    CUDA_CHECK(cudaDeviceSynchronize());  // Sync after initLSTMCell (uses GPU kernels) before CPU writes
     fread(cell->W_xi.data, sizeof(float), cell->W_xi.rows * cell->W_xi.cols, f);
     fread(cell->W_hi.data, sizeof(float), cell->W_hi.rows * cell->W_hi.cols, f);
     fread(cell->b_i.data, sizeof(float), cell->b_i.rows * cell->b_i.cols, f);
@@ -746,6 +751,7 @@ void loadModels(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     lstm_model->fc_hidden_b = createMatrix(lstm_model->hidden_size / 2, 1);
     lstm_model->fc_W = createMatrix(lstm_model->output_size, lstm_model->hidden_size / 2);
     lstm_model->fc_b = createMatrix(lstm_model->output_size, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());  // Sync before CPU writes to GPU memory
     fread(lstm_model->fc_hidden_W.data, sizeof(float), lstm_model->fc_hidden_W.rows * lstm_model->fc_hidden_W.cols, f);
     fread(lstm_model->fc_hidden_b.data, sizeof(float), lstm_model->fc_hidden_b.rows * lstm_model->fc_hidden_b.cols, f);
     fread(lstm_model->fc_W.data, sizeof(float), lstm_model->fc_W.rows * lstm_model->fc_W.cols, f);
@@ -765,12 +771,14 @@ void loadModels(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
         fread(&cols, sizeof(int), 1, f);
         Matrix W = createMatrix(rows, cols);
         Matrix b = createMatrix(rows, 1);
+        CUDA_CHECK(cudaDeviceSynchronize());  // Sync before CPU writes
         fread(W.data, sizeof(float), rows * cols, f);
         fread(b.data, sizeof(float), rows, f);
         dnn_model->layer_weights.push_back(W);
         dnn_model->layer_biases.push_back(b);
     }
     dnn_model->embedding = createMatrix(*vocab_size + 1, dnn_model->embed_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());  // Sync before CPU writes
     fread(dnn_model->embedding.data, sizeof(float), (*vocab_size + 1) * dnn_model->embed_dim, f);
     
     fclose(f);
