@@ -12,7 +12,7 @@
 // Training parameters
 const int EPOCHS = 50;
 const float LEARNING_RATE = 0.001f;
-const int MAX_SEQ_LEN = 50;  // Reduced from 200 for faster training
+const int MAX_SEQ_LEN = 50;
 
 // Timer helper using clock()
 class Timer {
@@ -42,7 +42,7 @@ public:
     }
 };
 
-void print_progress_bar(int current, int total, int width = 30) {
+void print_progress_bar(int current, int total, int width = 20) {
     float progress = (float)current / total;
     int filled = (int)(progress * width);
     
@@ -52,13 +52,14 @@ void print_progress_bar(int current, int total, int width = 30) {
         else if(i == filled) printf(">");
         else printf(" ");
     }
-    printf("] %.1f%%", progress * 100);
+    printf("]");
 }
 
 // Compute normalization statistics
 void computeStats(const std::vector<TrainingEntry>& entries,
                   float* mean, float* std_dev,
-                  float* start_coord_mean, float* start_coord_std) {
+                  float* start_coord_mean, float* start_coord_std,
+                  int* total_stroke_points) {
     std::vector<float> dx_vals, dy_vals, dt_vals;
     std::vector<float> start_x_vals, start_y_vals;
     
@@ -102,7 +103,7 @@ void computeStats(const std::vector<TrainingEntry>& entries,
         }
     }
     
-    printf("Computing stats from %zu delta samples\n", dx_vals.size());
+    *total_stroke_points = dx_vals.size();
     
     // Compute mean
     mean[0] = 0.0f; mean[1] = 0.0f; mean[2] = 0.0f;
@@ -151,28 +152,19 @@ bool prepareTrainingSample(const TrainingEntry& entry,
                            int** text_seq, int* text_len,
                            Matrix** stroke_inputs, Matrix** stroke_targets, int* stroke_len) {
     
-    printf("    [PREP] Checking entry size: %zu\n", entry.stroke_data.size());
-    fflush(stdout);
-    
     if(entry.stroke_data.size() < 3) return false;
     
     // Encode text
     *text_len = entry.entry_text.length();
-    printf("    [PREP] Encoding text, len=%d\n", *text_len);
-    fflush(stdout);
-    
     *text_seq = new int[*text_len];
     for(int i = 0; i < *text_len; i++) {
         auto it = char2idx.find(entry.entry_text[i]);
         if(it != char2idx.end()) {
             (*text_seq)[i] = it->second;
         } else {
-            (*text_seq)[i] = 0;  // Unknown char -> padding
+            (*text_seq)[i] = 0;
         }
     }
-    
-    printf("    [PREP] Sorting stroke points\n");
-    fflush(stdout);
     
     // Sort stroke points by timestamp
     std::vector<std::pair<std::string, StrokePoint>> sorted_points;
@@ -186,8 +178,6 @@ bool prepareTrainingSample(const TrainingEntry& entry,
     
     // Limit sequence length
     int seq_len = std::min((int)sorted_points.size() - 1, MAX_SEQ_LEN);
-    printf("    [PREP] seq_len=%d\n", seq_len);
-    fflush(stdout);
     
     if(seq_len < 2) {
         delete[] *text_seq;
@@ -195,18 +185,12 @@ bool prepareTrainingSample(const TrainingEntry& entry,
     }
     
     *stroke_len = seq_len;
-    printf("    [PREP] Allocating %d matrices\n", seq_len);
-    fflush(stdout);
-    
     *stroke_inputs = new Matrix[seq_len];
     *stroke_targets = new Matrix[seq_len];
     
     float prev_x = sorted_points[0].second.coordinates[0];
     float prev_y = sorted_points[0].second.coordinates[1];
     float prev_t = sorted_points[0].second.timestamp;
-    
-    printf("    [PREP] Creating input/target matrices...\n");
-    fflush(stdout);
     
     for(int i = 0; i < seq_len; i++) {
         const auto& curr = sorted_points[i + 1].second;
@@ -223,8 +207,6 @@ bool prepareTrainingSample(const TrainingEntry& entry,
         
         // Input: current state (use zeros for first, then previous output)
         (*stroke_inputs)[i] = createMatrix(5, 1);
-        
-        // Need to sync before CPU write to unified memory
         cudaDeviceSynchronize();
         
         if(i == 0) {
@@ -251,15 +233,12 @@ bool prepareTrainingSample(const TrainingEntry& entry,
         (*stroke_targets)[i].data[2] = dt_norm;
         (*stroke_targets)[i].data[3] = curr.pressure;
         (*stroke_targets)[i].data[4] = curr.tilt;
-        (*stroke_targets)[i].data[5] = (i == seq_len - 1) ? 1.0f : 0.0f;  // finished flag
+        (*stroke_targets)[i].data[5] = (i == seq_len - 1) ? 1.0f : 0.0f;
         
         prev_x = curr.coordinates[0];
         prev_y = curr.coordinates[1];
         prev_t = curr.timestamp;
     }
-    
-    printf("    [PREP] Done creating matrices\n");
-    fflush(stdout);
     
     return true;
 }
@@ -285,6 +264,7 @@ int main(int argc, char* argv[]) {
     
     srand(time(NULL));
     
+    // Load training data
     printf("Loading training data from %s...\n", input_file);
     std::vector<TrainingEntry> entries = parseTrainingJSON(input_file);
     if(entries.empty()) {
@@ -292,28 +272,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    printf("Loaded %zu entries\n", entries.size());
-    
     // Build vocabulary
     std::map<char, int> char2idx;
     std::map<int, char> idx2char;
     buildVocabulary(entries, char2idx, idx2char);
     int vocab_size = char2idx.size();
-    printf("Vocabulary size: %d\n", vocab_size);
     
     // Compute normalization statistics
     float mean[3] = {0.0f}, std_dev[3] = {0.0f};
     float start_coord_mean[2] = {0.0f}, start_coord_std[2] = {0.0f};
-    computeStats(entries, mean, std_dev, start_coord_mean, start_coord_std);
+    int total_stroke_points = 0;
+    computeStats(entries, mean, std_dev, start_coord_mean, start_coord_std, &total_stroke_points);
     
-    printf("Mean: [%.4f, %.4f, %.4f]\n", mean[0], mean[1], mean[2]);
-    printf("Std: [%.4f, %.4f, %.4f]\n", std_dev[0], std_dev[1], std_dev[2]);
-    printf("Start coord mean: [%.4f, %.4f]\n", start_coord_mean[0], start_coord_mean[1]);
-    printf("Start coord std: [%.4f, %.4f]\n", start_coord_std[0], start_coord_std[1]);
-    
-    // Initialize models (smaller for faster training)
-    int hidden_size = 128;  // Reduced for faster iteration
-    int embed_dim = 32;     // Reduced for faster iteration
+    // Initialize models
+    int hidden_size = 128;
+    int embed_dim = 32;
     
     TextConditionedLSTM lstm_model;
     initTextConditionedLSTM(&lstm_model, vocab_size, embed_dim, 5, hidden_size, 1, 6);
@@ -324,21 +297,36 @@ int main(int argc, char* argv[]) {
     initStartCoordDNN(&dnn_model, vocab_size, 16, hidden_dims, 2);
     initStartCoordDNNGradients(&dnn_model);
     
-    printf("\n========================================\n");
-    printf("       TRAINING CONFIGURATION\n");
-    printf("========================================\n");
-    printf("LSTM Model:\n");
-    printf("  - Vocabulary size: %d\n", vocab_size);
-    printf("  - Embedding dim:   %d\n", embed_dim);
-    printf("  - Hidden size:     %d\n", hidden_size);
-    printf("  - Input size:      5 (dx, dy, dt, pressure, tilt)\n");
-    printf("  - Output size:     6 (dx, dy, dt, pressure, tilt, finished)\n");
-    printf("\nTraining params:\n");
-    printf("  - Epochs:          %d\n", EPOCHS);
-    printf("  - Learning rate:   %.4f\n", LEARNING_RATE);
-    printf("  - Max seq length:  %d\n", MAX_SEQ_LEN);
-    printf("  - Training samples: %zu\n", entries.size());
-    printf("========================================\n\n");
+    // Print header with data summary
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                         HANDWRITING AI - TRAINING\n");
+    printf("================================================================================\n");
+    printf("\n");
+    printf("  DATA SUMMARY\n");
+    printf("  ------------\n");
+    printf("  Training samples:    %zu\n", entries.size());
+    printf("  Total stroke points: %d\n", total_stroke_points);
+    printf("  Vocabulary size:     %d\n", vocab_size);
+    printf("\n");
+    printf("  NORMALIZATION STATS\n");
+    printf("  -------------------\n");
+    printf("  Delta mean (dx, dy, dt):     [%7.4f, %7.4f, %7.4f]\n", mean[0], mean[1], mean[2]);
+    printf("  Delta std  (dx, dy, dt):     [%7.4f, %7.4f, %7.4f]\n", std_dev[0], std_dev[1], std_dev[2]);
+    printf("  Start coord mean (x, y):     [%7.4f, %7.4f]\n", start_coord_mean[0], start_coord_mean[1]);
+    printf("  Start coord std  (x, y):     [%7.4f, %7.4f]\n", start_coord_std[0], start_coord_std[1]);
+    printf("\n");
+    printf("  MODEL CONFIG\n");
+    printf("  ------------\n");
+    printf("  LSTM: vocab=%d, embed=%d, hidden=%d, in=5, out=6\n", vocab_size, embed_dim, hidden_size);
+    printf("  DNN:  vocab=%d, embed=16, hidden=[64,32], out=2\n", vocab_size);
+    printf("\n");
+    printf("  TRAINING CONFIG\n");
+    printf("  ---------------\n");
+    printf("  Epochs: %d | Learning rate: %.4f | Max seq len: %d\n", EPOCHS, LEARNING_RATE, MAX_SEQ_LEN);
+    printf("\n");
+    printf("================================================================================\n");
+    printf("\n");
     
     // Training loop
     float best_loss = 1e10f;
@@ -355,11 +343,7 @@ int main(int argc, char* argv[]) {
         float epoch_loss = 0.0f;
         int epoch_samples = 0;
         int epoch_skipped = 0;
-        int total_stroke_points = 0;
         epoch_timer.start();
-        
-        printf("\n--- Epoch %d/%d ---\n", epoch + 1, EPOCHS);
-        fflush(stdout);
         
         // Shuffle entries
         std::vector<int> indices(entries.size());
@@ -369,14 +353,8 @@ int main(int argc, char* argv[]) {
             std::swap(indices[i], indices[j]);
         }
         
-        printf("  Starting sample processing...\n");
-        fflush(stdout);
-        
         for(size_t idx = 0; idx < entries.size(); idx++) {
             const auto& entry = entries[indices[idx]];
-            
-            printf("  [DEBUG] Sample %zu: preparing...\n", idx + 1);
-            fflush(stdout);
             
             // Prepare training sample
             int* text_seq;
@@ -388,20 +366,12 @@ int main(int argc, char* argv[]) {
             if(!prepareTrainingSample(entry, char2idx, mean, std_dev,
                                       &text_seq, &text_len,
                                       &stroke_inputs, &stroke_targets, &stroke_len)) {
-                printf("  [DEBUG] Sample %zu: skipped\n", idx + 1);
-                fflush(stdout);
                 epoch_skipped++;
                 continue;
             }
             
-            printf("  [DEBUG] Sample %zu: seq_len=%d, text_len=%d, zeroing gradients...\n", idx + 1, stroke_len, text_len);
-            fflush(stdout);
-            
             // Zero gradients
             zeroTextConditionedLSTMGradients(&lstm_model);
-            
-            printf("  [DEBUG] Sample %zu: forward pass...\n", idx + 1);
-            fflush(stdout);
             
             // Forward pass with cache
             Matrix output;
@@ -409,26 +379,16 @@ int main(int argc, char* argv[]) {
             textConditionedLSTMForwardWithCache(&lstm_model, text_seq, text_len,
                                                 stroke_inputs, stroke_len, &output, &cache);
             
-            printf("  [DEBUG] Sample %zu: backward pass...\n", idx + 1);
-            fflush(stdout);
-            
             // Backward pass
             float sample_loss;
             textConditionedLSTMBackward(&lstm_model, &cache, stroke_targets, stroke_len, &sample_loss);
             
-            printf("  [DEBUG] Sample %zu: applying gradients, loss=%.4f...\n", idx + 1, sample_loss);
-            fflush(stdout);
-            
             // Apply gradients
             applyTextConditionedLSTMGradients(&lstm_model, LEARNING_RATE);
-            
-            printf("  [DEBUG] Sample %zu: done!\n", idx + 1);
-            fflush(stdout);
             
             epoch_loss += sample_loss;
             epoch_samples++;
             samples_trained++;
-            total_stroke_points += stroke_len;
             
             // Update running loss
             running_loss = (running_loss * running_count + sample_loss) / (running_count + 1);
@@ -439,59 +399,47 @@ int main(int argc, char* argv[]) {
             freeTextConditionedLSTMCache(&cache);
             freeTrainingSample(text_seq, stroke_inputs, stroke_targets, stroke_len);
             
-            // Detailed progress update every 10 samples
-            if(epoch_samples % 10 == 0 || idx == entries.size() - 1) {
-                double elapsed = epoch_timer.elapsed_seconds();
-                double samples_per_sec = (elapsed > 0) ? epoch_samples / elapsed : 0;
-                int remaining_samples = entries.size() - idx - 1;
-                double eta_seconds = (samples_per_sec > 0) ? remaining_samples / samples_per_sec : 0;
-                
-                char eta_buf[64];
-                epoch_timer.format_time(eta_seconds, eta_buf, sizeof(eta_buf));
-                
-                printf("\r  ");
-                print_progress_bar(idx + 1, entries.size());
-                printf(" | Loss: %.4f | %.1f samples/s | ETA: %s    ", 
-                       running_loss, samples_per_sec, eta_buf);
-                fflush(stdout);
-            }
+            // Update progress display
+            double elapsed = epoch_timer.elapsed_seconds();
+            double samples_per_sec = (elapsed > 0) ? epoch_samples / elapsed : 0;
+            double total_elapsed = total_timer.elapsed_seconds();
+            double avg_epoch_time = total_elapsed / (epoch + (idx + 1.0) / entries.size());
+            double total_eta = avg_epoch_time * EPOCHS - total_elapsed;
+            
+            char total_time_buf[64], eta_buf[64];
+            total_timer.format_time(total_elapsed, total_time_buf, sizeof(total_time_buf));
+            total_timer.format_time(total_eta > 0 ? total_eta : 0, eta_buf, sizeof(eta_buf));
+            
+            // Print two-line progress
+            printf("\r  Overall: ");
+            print_progress_bar(epoch * entries.size() + idx + 1, EPOCHS * entries.size());
+            printf(" Epoch %2d/%-2d | Best: %.4f | Time: %s | ETA: %s        \n",
+                   epoch + 1, EPOCHS, best_loss < 1e9f ? best_loss : 0.0f, total_time_buf, eta_buf);
+            
+            printf("  Epoch:   ");
+            print_progress_bar(idx + 1, entries.size());
+            printf(" %3zu/%-3zu   | Loss: %.4f | %.1f samp/s                    ",
+                   idx + 1, entries.size(), running_loss, samples_per_sec);
+            
+            // Move cursor up one line for next update
+            printf("\033[1A\r");
+            fflush(stdout);
         }
         
-        printf("\n");  // New line after progress bar
-        
-        double epoch_time = epoch_timer.elapsed_seconds();
+        // End of epoch - move to new lines
+        printf("\n\n");
         
         if(epoch_samples > 0) {
             float avg_loss = epoch_loss / epoch_samples;
-            float loss_improvement = (best_loss - avg_loss) / best_loss * 100;
-            
-            char epoch_time_buf[64], total_time_buf[64], remaining_time_buf[64];
-            epoch_timer.format_time(epoch_time, epoch_time_buf, sizeof(epoch_time_buf));
-            total_timer.format_time(total_timer.elapsed_seconds(), total_time_buf, sizeof(total_time_buf));
-            
-            // Estimate remaining time
-            double avg_epoch_time = total_timer.elapsed_seconds() / (epoch + 1);
-            double remaining_time = avg_epoch_time * (EPOCHS - epoch - 1);
-            total_timer.format_time(remaining_time, remaining_time_buf, sizeof(remaining_time_buf));
-            
-            printf("\n  Epoch Summary:\n");
-            printf("    - Samples trained:  %d (skipped: %d)\n", epoch_samples, epoch_skipped);
-            printf("    - Stroke points:    %d\n", total_stroke_points);
-            printf("    - Average loss:     %.6f\n", avg_loss);
-            printf("    - Best loss so far: %.6f\n", best_loss);
-            printf("    - Epoch time:       %s\n", epoch_time_buf);
-            printf("    - Total time:       %s\n", total_time_buf);
-            printf("    - Est. remaining:   %s\n", remaining_time_buf);
             
             // Save best model
             if(avg_loss < best_loss) {
-                loss_improvement = (best_loss - avg_loss) / best_loss * 100;
+                float improvement = (best_loss < 1e9f) ? (best_loss - avg_loss) / best_loss * 100 : 0;
                 best_loss = avg_loss;
-                printf("\n  *** NEW BEST LOSS! ");
-                if(best_loss < 1e9f) {
-                    printf("(improved by %.2f%%) ", loss_improvement);
-                }
-                printf("Saving checkpoint... ***\n");
+                
+                printf("  [*] New best loss: %.6f", best_loss);
+                if(improvement > 0) printf(" (%.1f%% improvement)", improvement);
+                printf(" - Saving model...\n");
                 
                 // Prepare char2idx arrays for saving
                 int* char2idx_keys = new int[vocab_size];
@@ -508,8 +456,6 @@ int main(int argc, char* argv[]) {
                 
                 delete[] char2idx_keys;
                 delete[] char2idx_values;
-                
-                printf("    Saved to: %s\n", output_file);
             }
         }
     }
@@ -517,15 +463,16 @@ int main(int argc, char* argv[]) {
     char final_time_buf[64];
     total_timer.format_time(total_timer.elapsed_seconds(), final_time_buf, sizeof(final_time_buf));
     
-    printf("\n========================================\n");
-    printf("        TRAINING COMPLETE!\n");
-    printf("========================================\n");
-    printf("Final Statistics:\n");
-    printf("  - Total samples trained: %d\n", samples_trained);
-    printf("  - Best loss achieved:    %.6f\n", best_loss);
-    printf("  - Total training time:   %s\n", final_time_buf);
-    printf("  - Model saved to:        %s\n", output_file);
-    printf("========================================\n\n");
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                            TRAINING COMPLETE\n");
+    printf("================================================================================\n");
+    printf("  Total samples trained: %d\n", samples_trained);
+    printf("  Best loss achieved:    %.6f\n", best_loss);
+    printf("  Total training time:   %s\n", final_time_buf);
+    printf("  Model saved to:        %s\n", output_file);
+    printf("================================================================================\n");
+    printf("\n");
     
     // Cleanup
     freeTextConditionedLSTM(&lstm_model);

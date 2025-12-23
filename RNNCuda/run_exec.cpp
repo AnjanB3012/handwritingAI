@@ -6,9 +6,23 @@
 #include <map>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 // Maximum generation steps
 const int MAX_STEPS = 1200;
+
+void print_progress_bar(int current, int total, int width = 30) {
+    float progress = (float)current / total;
+    int filled = (int)(progress * width);
+    
+    printf("[");
+    for(int i = 0; i < width; i++) {
+        if(i < filled) printf("=");
+        else if(i == filled) printf(">");
+        else printf(" ");
+    }
+    printf("]");
+}
 
 // Generate handwriting strokes
 void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
@@ -20,7 +34,6 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     int text_len = strlen(text);
     int* text_seq = new int[text_len];
     for(int i = 0; i < text_len; i++) {
-        // Find char in char2idx
         text_seq[i] = 0;  // Default to padding
         for(int j = 0; j < vocab_size; j++) {
             if((char)char2idx_keys[j] == text[i]) {
@@ -33,14 +46,14 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     // Get first character index
     int first_char_idx = (text_len > 0) ? text_seq[0] : 0;
     
-    // Compute length features (simplified - would need proper stats)
+    // Compute length features
     float len_first_word = 0.0f;
     const char* space = strchr(text, ' ');
     if(space) len_first_word = space - text;
     else len_first_word = text_len;
     float len_text = text_len;
     
-    // Normalize length features (using approximate stats)
+    // Normalize length features
     float len_first_word_mean = 5.0f, len_first_word_std = 3.0f;
     float len_text_mean = 20.0f, len_text_std = 15.0f;
     float len_features[2] = {
@@ -52,15 +65,18 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     Matrix start_coord_norm;
     startCoordDNNForward(dnn_model, first_char_idx, len_features, &start_coord_norm);
     
+    // Sync before CPU reads from GPU memory
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Denormalize
     start_coords[0] = start_coord_norm.data[0] * start_coord_std[0] + start_coord_mean[0];
     start_coords[1] = start_coord_norm.data[1] * start_coord_std[1] + start_coord_mean[1];
     
     freeMatrix(start_coord_norm);
     
-    std::cout << "Predicted start coordinates: (" << start_coords[0] << ", " << start_coords[1] << ")" << std::endl;
+    printf("  Start coordinates: (%.2f, %.2f)\n", start_coords[0], start_coords[1]);
     
-    // Initialize stroke sequence with zero point (as column vector)
+    // Initialize stroke sequence with zero point
     std::vector<Matrix> stroke_seq;
     Matrix initial = createMatrix(5, 1);
     fillMatrix(initial, 0.0f);
@@ -68,28 +84,35 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
     // Sync before CPU writes to GPU memory
     CUDA_CHECK(cudaDeviceSynchronize());
     
-    // Normalize initial point
     initial.data[0] = (0.0f - mean[0]) / std[0];
     initial.data[1] = (0.0f - mean[1]) / std[1];
     initial.data[2] = (0.0f - mean[2]) / std[2];
-    initial.data[3] = 0.0f;  // pressure
-    initial.data[4] = 0.0f;  // tilt
+    initial.data[3] = 0.0f;
+    initial.data[4] = 0.0f;
     stroke_seq.push_back(initial);
     
     // Generate strokes autoregressively
     float x = start_coords[0], y = start_coords[1];
     
+    printf("\n  Generating strokes...\n");
+    
     for(int step = 0; step < MAX_STEPS; step++) {
-        // Prepare input sequence (convert vector to array)
+        // Prepare input sequence
         Matrix* input_seq = new Matrix[stroke_seq.size()];
         for(size_t i = 0; i < stroke_seq.size(); i++) {
             input_seq[i] = createMatrix(5, 1);
             copyMatrix(stroke_seq[i], input_seq[i]);
         }
         
+        // Sync before forward pass uses this data
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
         // Forward pass
         Matrix output;
         textConditionedLSTMForward(lstm_model, text_seq, text_len, input_seq, stroke_seq.size(), &output);
+        
+        // Sync before CPU reads output
+        CUDA_CHECK(cudaDeviceSynchronize());
         
         // Get last prediction
         int last_idx = stroke_seq.size() - 1;
@@ -117,35 +140,47 @@ void generateStrokes(TextConditionedLSTM* lstm_model, StartCoordDNN* dnn_model,
         x += dx;
         y += dy;
         
-        // Check stopping condition
-        if(finished > 0.5f || step >= MAX_STEPS - 1) {
-            std::cout << "Stopping generation (finished=" << finished << ", step=" << step << ")" << std::endl;
-            break;
-        }
+        // Update progress
+        printf("\r  ");
+        print_progress_bar(step + 1, MAX_STEPS);
+        printf(" Step %4d | Points: %4zu | Pos: (%6.1f, %6.1f) | Finished: %.2f",
+               step + 1, strokes.size(), x, y, finished);
+        fflush(stdout);
         
-        // Append normalized point to sequence for next iteration (as column vector)
-        Matrix new_point = createMatrix(5, 1);
-        new_point.data[0] = dx_norm;
-        new_point.data[1] = dy_norm;
-        new_point.data[2] = dt_norm;
-        new_point.data[3] = pressure;
-        new_point.data[4] = tilt;
-        stroke_seq.push_back(new_point);
-        
-        // Cleanup input_seq (stroke_seq matrices are still needed)
+        // Cleanup this iteration
         freeMatrix(output);
         for(size_t i = 0; i < stroke_seq.size(); i++) {
             freeMatrix(input_seq[i]);
         }
         delete[] input_seq;
         
-        if(step % 50 == 0) {
-            std::cout << "Step " << step << ": dx=" << dx << ", dy=" << dy 
-                      << ", finished=" << finished << std::endl;
+        // Check stopping condition
+        if(finished > 0.5f) {
+            printf("\n  Generation complete (finished signal received)\n");
+            break;
         }
+        
+        if(step >= MAX_STEPS - 1) {
+            printf("\n  Generation complete (max steps reached)\n");
+            break;
+        }
+        
+        // Append normalized point to sequence for next iteration
+        Matrix new_point = createMatrix(5, 1);
+        
+        // Sync before CPU writes
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        new_point.data[0] = dx_norm;
+        new_point.data[1] = dy_norm;
+        new_point.data[2] = dt_norm;
+        new_point.data[3] = pressure;
+        new_point.data[4] = tilt;
+        stroke_seq.push_back(new_point);
     }
     
     // Cleanup stroke_seq
+    CUDA_CHECK(cudaDeviceSynchronize());
     for(size_t i = 0; i < stroke_seq.size(); i++) {
         freeMatrix(stroke_seq[i]);
     }
@@ -158,7 +193,7 @@ void strokesToJSON(const std::vector<std::vector<float>>& strokes, float* start_
                     const char* output_file) {
     std::ofstream out(output_file);
     if(!out.is_open()) {
-        std::cerr << "Error: Cannot open output file " << output_file << std::endl;
+        fprintf(stderr, "Error: Cannot open output file %s\n", output_file);
         return;
     }
     
@@ -192,7 +227,7 @@ void strokesToJSON(const std::vector<std::vector<float>>& strokes, float* start_
 
 int main(int argc, char* argv[]) {
     if(argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <model.bin> <input.txt> <output.json>" << std::endl;
+        fprintf(stderr, "Usage: %s <model.bin> <input.txt> <output.json>\n", argv[0]);
         return 1;
     }
     
@@ -203,7 +238,7 @@ int main(int argc, char* argv[]) {
     // Read input text
     std::ifstream in(input_file);
     if(!in.is_open()) {
-        std::cerr << "Error: Cannot open input file " << input_file << std::endl;
+        fprintf(stderr, "Error: Cannot open input file %s\n", input_file);
         return 1;
     }
     
@@ -211,35 +246,55 @@ int main(int argc, char* argv[]) {
     std::getline(in, text);
     in.close();
     
-    std::cout << "Input text: " << text << std::endl;
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                      HANDWRITING AI - GENERATION\n");
+    printf("================================================================================\n");
+    printf("\n");
+    printf("  Input text: \"%s\"\n", text.c_str());
+    printf("  Text length: %zu characters\n", text.length());
+    printf("\n");
     
     // Load models
     TextConditionedLSTM lstm_model;
     StartCoordDNN dnn_model;
     float mean[3], std[3];
     float start_coord_mean[2], start_coord_std[2];
-    int* char2idx_keys = new int[1000];  // Max vocab size
+    int* char2idx_keys = new int[1000];
     int* char2idx_values = new int[1000];
     int vocab_size;
     
-    std::cout << "Loading models from " << model_file << "..." << std::endl;
+    printf("  Loading model from %s...\n", model_file);
     loadModels(&lstm_model, &dnn_model, model_file, mean, std,
                start_coord_mean, start_coord_std, char2idx_keys, char2idx_values, &vocab_size);
     
-    std::cout << "Models loaded. Vocabulary size: " << vocab_size << std::endl;
+    printf("  Model loaded (vocab size: %d)\n", vocab_size);
+    printf("\n");
     
     // Generate strokes
     std::vector<std::vector<float>> strokes;
     float start_coords[2];
     
-    std::cout << "Generating strokes..." << std::endl;
     generateStrokes(&lstm_model, &dnn_model, text.c_str(), char2idx_keys, char2idx_values, vocab_size,
                     mean, std, start_coord_mean, start_coord_std, strokes, start_coords);
     
-    std::cout << "Generated " << strokes.size() << " strokes" << std::endl;
+    printf("\n");
+    printf("  RESULTS\n");
+    printf("  -------\n");
+    printf("  Total stroke points: %zu\n", strokes.size());
+    printf("  Start position: (%.2f, %.2f)\n", start_coords[0], start_coords[1]);
+    
+    // Calculate final position
+    float final_x = start_coords[0], final_y = start_coords[1];
+    for(const auto& s : strokes) {
+        final_x += s[0];
+        final_y += s[1];
+    }
+    printf("  Final position: (%.2f, %.2f)\n", final_x, final_y);
+    printf("\n");
     
     // Save to JSON
-    std::cout << "Saving to " << output_file << "..." << std::endl;
+    printf("  Saving to %s...\n", output_file);
     strokesToJSON(strokes, start_coords, output_file);
     
     // Cleanup
@@ -248,6 +303,10 @@ int main(int argc, char* argv[]) {
     delete[] char2idx_keys;
     delete[] char2idx_values;
     
-    std::cout << "Done!" << std::endl;
+    printf("  Done!\n");
+    printf("\n");
+    printf("================================================================================\n");
+    printf("\n");
+    
     return 0;
 }
