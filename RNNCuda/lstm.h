@@ -4,6 +4,30 @@
 #include "matrix.h"
 #include <vector>
 
+// Pre-allocated workspace for LSTM operations (avoids malloc/free per call)
+struct LSTMWorkspace {
+    // Temporary matrices for forward pass
+    Matrix temp1, temp2;
+    Matrix temp_c1, temp_c2;
+    
+    // Temporary matrices for backward pass
+    Matrix do_gate, dc_from_h, one_minus_tanh_sq, dc;
+    Matrix df_gate, di_gate, dc_tilde;
+    Matrix do_pre, df_pre, di_pre, dc_tilde_pre;
+    Matrix temp_grad, temp_grad_h;
+    Matrix dx_temp, dh_temp;
+    
+    int hidden_size;
+    int input_size;
+    bool initialized;
+};
+
+// Initialize workspace (call once at start)
+void initLSTMWorkspace(LSTMWorkspace* ws, int input_size, int hidden_size);
+
+// Free workspace (call once at end)
+void freeLSTMWorkspace(LSTMWorkspace* ws);
+
 // LSTM Cell structure with gradients
 struct LSTMCell {
     // Input gate weights and biases
@@ -60,9 +84,17 @@ void zeroLSTMCellGradients(LSTMCell* cell);
 void lstmForwardWithCache(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev, 
                           Matrix* h_out, Matrix* c_out, LSTMCache* cache);
 
+// Forward pass with workspace (faster - uses pre-allocated buffers)
+void lstmForwardWithCacheWS(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev, 
+                            Matrix* h_out, Matrix* c_out, LSTMCache* cache, LSTMWorkspace* ws);
+
 // Backward pass for single timestep
 void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_next,
                   Matrix* dh_prev, Matrix* dc_prev, Matrix* dx);
+
+// Backward pass with workspace (faster - uses pre-allocated buffers)
+void lstmBackwardWS(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_next,
+                    Matrix* dh_prev, Matrix* dc_prev, Matrix* dx, LSTMWorkspace* ws);
 
 // Forward pass for single timestep (without cache)
 void lstmForward(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev, Matrix* h_out, Matrix* c_out);

@@ -4,6 +4,72 @@
 #include <cmath>
 #include <cuda_runtime.h>
 
+// ============ TRAINING WORKSPACE MANAGEMENT ============
+
+void initTextConditionedLSTMTrainingWorkspace(TextConditionedLSTMTrainingWorkspace* ws,
+                                               int input_size, int hidden_size, 
+                                               int embed_dim, int output_size, int max_text_len) {
+    ws->input_size = input_size;
+    ws->hidden_size = hidden_size;
+    ws->embed_dim = embed_dim;
+    ws->output_size = output_size;
+    ws->max_text_len = max_text_len;
+    
+    // Initialize LSTM workspace
+    initLSTMWorkspace(&ws->lstm_ws, input_size + embed_dim, hidden_size);
+    
+    // Forward pass temporaries
+    ws->h_prev = createMatrix(hidden_size, 1);
+    ws->c_prev = createMatrix(hidden_size, 1);
+    ws->h_new = createMatrix(hidden_size, 1);
+    ws->c_new = createMatrix(hidden_size, 1);
+    ws->combined_input = createMatrix(input_size + embed_dim, 1);
+    ws->fc1_pre = createMatrix(hidden_size / 2, 1);
+    ws->fc2_out = createMatrix(output_size, 1);
+    ws->text_emb = createMatrix(max_text_len, embed_dim);
+    
+    // Backward pass temporaries
+    ws->dh_next = createMatrix(hidden_size, 1);
+    ws->dc_next = createMatrix(hidden_size, 1);
+    ws->dout = createMatrix(output_size, 1);
+    ws->dfc_W_temp = createMatrix(output_size, hidden_size / 2);
+    ws->dfc1_out = createMatrix(hidden_size / 2, 1);
+    ws->dfc1_pre = createMatrix(hidden_size / 2, 1);
+    ws->dfc_hidden_W_temp = createMatrix(hidden_size / 2, hidden_size);
+    ws->dh = createMatrix(hidden_size, 1);
+    
+    ws->initialized = true;
+    
+    // Single sync after all allocations
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void freeTextConditionedLSTMTrainingWorkspace(TextConditionedLSTMTrainingWorkspace* ws) {
+    if (!ws->initialized) return;
+    
+    freeLSTMWorkspace(&ws->lstm_ws);
+    
+    freeMatrix(ws->h_prev);
+    freeMatrix(ws->c_prev);
+    freeMatrix(ws->h_new);
+    freeMatrix(ws->c_new);
+    freeMatrix(ws->combined_input);
+    freeMatrix(ws->fc1_pre);
+    freeMatrix(ws->fc2_out);
+    freeMatrix(ws->text_emb);
+    
+    freeMatrix(ws->dh_next);
+    freeMatrix(ws->dc_next);
+    freeMatrix(ws->dout);
+    freeMatrix(ws->dfc_W_temp);
+    freeMatrix(ws->dfc1_out);
+    freeMatrix(ws->dfc1_pre);
+    freeMatrix(ws->dfc_hidden_W_temp);
+    freeMatrix(ws->dh);
+    
+    ws->initialized = false;
+}
+
 void initTextConditionedLSTM(TextConditionedLSTM* model, int vocab_size, int embed_dim,
                              int input_size, int hidden_size, int num_layers, int output_size) {
     model->vocab_size = vocab_size;
@@ -264,6 +330,116 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
     freeMatrix(c_prev);
 }
 
+// Workspace-based forward pass (faster - uses pre-allocated buffers)
+void textConditionedLSTMForwardWithCacheWS(TextConditionedLSTM* model, int* text_seq, int text_len,
+                                           Matrix* stroke_seq, int stroke_len, Matrix* output,
+                                           TextConditionedLSTMCache* cache,
+                                           TextConditionedLSTMTrainingWorkspace* ws) {
+    // Save text info for backprop
+    cache->text_seq = new int[text_len];
+    memcpy(cache->text_seq, text_seq, text_len * sizeof(int));
+    cache->text_len = text_len;
+    
+    // Single sync before CPU access to GPU memory
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Embed text and compute context vector
+    int non_zero_count = 0;
+    for(int i = 0; i < text_len; i++) {
+        if(text_seq[i] != 0) {
+            non_zero_count++;
+            for(int j = 0; j < model->embed_dim; j++) {
+                ws->text_emb.data[i * model->embed_dim + j] = 
+                    model->embedding.data[text_seq[i] * model->embed_dim + j];
+            }
+        }
+    }
+    
+    // Average embeddings (context vector)
+    cache->context = createMatrix(1, model->embed_dim);
+    fillMatrix(cache->context, 0.0f);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    if(non_zero_count > 0) {
+        for(int i = 0; i < text_len; i++) {
+            if(text_seq[i] != 0) {
+                for(int j = 0; j < model->embed_dim; j++) {
+                    cache->context.data[j] += ws->text_emb.data[i * model->embed_dim + j];
+                }
+            }
+        }
+        scale(cache->context, 1.0f / non_zero_count);
+    }
+    
+    // Process each timestep
+    cache->lstm_caches.resize(stroke_len);
+    cache->fc1_inputs.resize(stroke_len);
+    cache->fc1_pre_relu.resize(stroke_len);
+    cache->fc1_outputs.resize(stroke_len);
+    cache->fc2_outputs.resize(stroke_len);
+    
+    fillMatrix(ws->h_prev, 0.0f);
+    fillMatrix(ws->c_prev, 0.0f);
+    
+    // Sync context read
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    for(int t = 0; t < stroke_len; t++) {
+        // Concatenate stroke input with context (use pre-allocated combined_input)
+        for(int i = 0; i < model->input_size; i++) {
+            ws->combined_input.data[i] = stroke_seq[t].data[i];
+        }
+        for(int i = 0; i < model->embed_dim; i++) {
+            ws->combined_input.data[model->input_size + i] = cache->context.data[i];
+        }
+        
+        // LSTM forward with workspace
+        lstmForwardWithCacheWS(&model->lstm_layer.cells[0], ws->combined_input, ws->h_prev, ws->c_prev, 
+                               &ws->h_new, &ws->c_new, &cache->lstm_caches[t], &ws->lstm_ws);
+        
+        // Save h for FC backprop
+        cache->fc1_inputs[t] = createMatrix(model->hidden_size, 1);
+        copyMatrix(ws->h_new, cache->fc1_inputs[t]);
+        
+        // FC layers (reuse ws->fc1_pre and ws->fc2_out)
+        matmul(model->fc_hidden_W, ws->h_new, ws->fc1_pre);
+        add(ws->fc1_pre, model->fc_hidden_b, ws->fc1_pre);
+        
+        cache->fc1_pre_relu[t] = createMatrix(model->hidden_size / 2, 1);
+        copyMatrix(ws->fc1_pre, cache->fc1_pre_relu[t]);
+        
+        relu(ws->fc1_pre);
+        cache->fc1_outputs[t] = createMatrix(model->hidden_size / 2, 1);
+        copyMatrix(ws->fc1_pre, cache->fc1_outputs[t]);
+        
+        matmul(model->fc_W, ws->fc1_pre, ws->fc2_out);
+        add(ws->fc2_out, model->fc_b, ws->fc2_out);
+        
+        // Sync before CPU reads fc2_out
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Apply sigmoid to finished flag
+        float finished_val = ws->fc2_out.data[model->output_size - 1];
+        ws->fc2_out.data[model->output_size - 1] = 1.0f / (1.0f + expf(-finished_val));
+        
+        cache->fc2_outputs[t] = createMatrix(model->output_size, 1);
+        copyMatrix(ws->fc2_out, cache->fc2_outputs[t]);
+        
+        copyMatrix(ws->h_new, ws->h_prev);
+        copyMatrix(ws->c_new, ws->c_prev);
+    }
+    
+    // Final sync and copy outputs
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    *output = createMatrix(stroke_len, model->output_size);
+    for(int t = 0; t < stroke_len; t++) {
+        for(int i = 0; i < model->output_size; i++) {
+            output->data[t * model->output_size + i] = cache->fc2_outputs[t].data[i];
+        }
+    }
+}
+
 void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTMCache* cache,
                                  Matrix* target_seq, int seq_len, float* loss) {
     // Compute loss and gradients
@@ -377,6 +553,95 @@ void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTM
     
     freeMatrix(dh_next);
     freeMatrix(dc_next);
+}
+
+// Workspace-based backward pass (faster - uses pre-allocated buffers)
+void textConditionedLSTMBackwardWS(TextConditionedLSTM* model, TextConditionedLSTMCache* cache,
+                                   Matrix* target_seq, int seq_len, float* loss,
+                                   TextConditionedLSTMTrainingWorkspace* ws) {
+    *loss = 0.0f;
+    
+    // Initialize gradients using workspace buffers
+    fillMatrix(ws->dh_next, 0.0f);
+    fillMatrix(ws->dc_next, 0.0f);
+    
+    // Sync before CPU reads from cache and target_seq
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Backprop through time (reverse order)
+    for(int t = seq_len - 1; t >= 0; t--) {
+        // Compute output loss gradient (reuse ws->dout)
+        for(int i = 0; i < model->output_size - 1; i++) {
+            float diff = cache->fc2_outputs[t].data[i] - target_seq[t].data[i];
+            ws->dout.data[i] = 2.0f * diff / (float)(model->output_size - 1);
+            *loss += diff * diff / (float)(model->output_size - 1);
+        }
+        
+        float pred_finished = cache->fc2_outputs[t].data[model->output_size - 1];
+        float target_finished = target_seq[t].data[model->output_size - 1];
+        ws->dout.data[model->output_size - 1] = pred_finished - target_finished;
+        *loss += -target_finished * logf(pred_finished + 1e-8f) 
+                 - (1.0f - target_finished) * logf(1.0f - pred_finished + 1e-8f);
+        
+        // Backprop through fc2
+        matmulTranspose(ws->dout, cache->fc1_outputs[t], ws->dfc_W_temp);
+        addInplace(model->dfc_W, ws->dfc_W_temp);
+        addInplace(model->dfc_b, ws->dout);
+        
+        transposeMatmul(model->fc_W, ws->dout, ws->dfc1_out);
+        
+        // Backprop through ReLU
+        reluBackward(ws->dfc1_out, cache->fc1_pre_relu[t], ws->dfc1_pre);
+        
+        // Backprop through fc1
+        matmulTranspose(ws->dfc1_pre, cache->fc1_inputs[t], ws->dfc_hidden_W_temp);
+        addInplace(model->dfc_hidden_W, ws->dfc_hidden_W_temp);
+        addInplace(model->dfc_hidden_b, ws->dfc1_pre);
+        
+        // dh = fc_hidden_W^T * dfc1_pre + dh_next
+        transposeMatmul(model->fc_hidden_W, ws->dfc1_pre, ws->dh);
+        addInplace(ws->dh, ws->dh_next);
+        
+        // Backprop through LSTM with workspace
+        Matrix dh_prev, dc_prev, dx;
+        lstmBackwardWS(&model->lstm_layer.cells[0], &cache->lstm_caches[t], ws->dh, ws->dc_next,
+                       &dh_prev, &dc_prev, &dx, &ws->lstm_ws);
+        
+        // Update dh_next and dc_next for next iteration
+        copyMatrix(dh_prev, ws->dh_next);
+        copyMatrix(dc_prev, ws->dc_next);
+        
+        // Sync before CPU reads dx.data
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Backprop through context embedding
+        for(int i = 0; i < cache->text_len; i++) {
+            int char_idx = cache->text_seq[i];
+            if(char_idx != 0) {
+                for(int j = 0; j < model->embed_dim; j++) {
+                    model->dembedding.data[char_idx * model->embed_dim + j] += 
+                        dx.data[model->input_size + j];
+                }
+            }
+        }
+        
+        // Cleanup outputs from lstmBackwardWS (these are allocated inside)
+        freeMatrix(dh_prev);
+        freeMatrix(dc_prev);
+        freeMatrix(dx);
+    }
+    
+    *loss /= (float)seq_len;
+    
+    // Clip gradients
+    clipGradients(model->dfc_W, 5.0f);
+    clipGradients(model->dfc_b, 5.0f);
+    clipGradients(model->dfc_hidden_W, 5.0f);
+    clipGradients(model->dfc_hidden_b, 5.0f);
+    clipGradients(model->dembedding, 5.0f);
+    
+    // Final sync
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void applyTextConditionedLSTMGradients(TextConditionedLSTM* model, float lr) {

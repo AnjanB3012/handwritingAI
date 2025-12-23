@@ -2,6 +2,68 @@
 #include <cstdlib>
 #include <cmath>
 
+// ============ WORKSPACE MANAGEMENT ============
+
+void initLSTMWorkspace(LSTMWorkspace* ws, int input_size, int hidden_size) {
+    ws->input_size = input_size;
+    ws->hidden_size = hidden_size;
+    
+    // Forward pass temporaries
+    ws->temp1 = createMatrix(hidden_size, 1);
+    ws->temp2 = createMatrix(hidden_size, 1);
+    ws->temp_c1 = createMatrix(hidden_size, 1);
+    ws->temp_c2 = createMatrix(hidden_size, 1);
+    
+    // Backward pass temporaries
+    ws->do_gate = createMatrix(hidden_size, 1);
+    ws->dc_from_h = createMatrix(hidden_size, 1);
+    ws->one_minus_tanh_sq = createMatrix(hidden_size, 1);
+    ws->dc = createMatrix(hidden_size, 1);
+    ws->df_gate = createMatrix(hidden_size, 1);
+    ws->di_gate = createMatrix(hidden_size, 1);
+    ws->dc_tilde = createMatrix(hidden_size, 1);
+    ws->do_pre = createMatrix(hidden_size, 1);
+    ws->df_pre = createMatrix(hidden_size, 1);
+    ws->di_pre = createMatrix(hidden_size, 1);
+    ws->dc_tilde_pre = createMatrix(hidden_size, 1);
+    ws->temp_grad = createMatrix(hidden_size, input_size);
+    ws->temp_grad_h = createMatrix(hidden_size, hidden_size);
+    ws->dx_temp = createMatrix(input_size, 1);
+    ws->dh_temp = createMatrix(hidden_size, 1);
+    
+    ws->initialized = true;
+    
+    // Single sync after all allocations
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void freeLSTMWorkspace(LSTMWorkspace* ws) {
+    if (!ws->initialized) return;
+    
+    freeMatrix(ws->temp1);
+    freeMatrix(ws->temp2);
+    freeMatrix(ws->temp_c1);
+    freeMatrix(ws->temp_c2);
+    
+    freeMatrix(ws->do_gate);
+    freeMatrix(ws->dc_from_h);
+    freeMatrix(ws->one_minus_tanh_sq);
+    freeMatrix(ws->dc);
+    freeMatrix(ws->df_gate);
+    freeMatrix(ws->di_gate);
+    freeMatrix(ws->dc_tilde);
+    freeMatrix(ws->do_pre);
+    freeMatrix(ws->df_pre);
+    freeMatrix(ws->di_pre);
+    freeMatrix(ws->dc_tilde_pre);
+    freeMatrix(ws->temp_grad);
+    freeMatrix(ws->temp_grad_h);
+    freeMatrix(ws->dx_temp);
+    freeMatrix(ws->dh_temp);
+    
+    ws->initialized = false;
+}
+
 void initLSTMCell(LSTMCell* cell, int input_size, int hidden_size) {
     cell->input_size = input_size;
     cell->hidden_size = hidden_size;
@@ -170,6 +232,84 @@ void lstmForwardWithCache(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_pr
     freeMatrix(h_new);
 }
 
+// Workspace-based forward pass (no malloc/free per call - much faster)
+void lstmForwardWithCacheWS(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev,
+                            Matrix* h_out, Matrix* c_out, LSTMCache* cache, LSTMWorkspace* ws) {
+    // Save inputs for backprop
+    cache->x_t = createMatrix(x_t.rows, x_t.cols);
+    cache->h_prev = createMatrix(h_prev.rows, h_prev.cols);
+    cache->c_prev = createMatrix(c_prev.rows, c_prev.cols);
+    copyMatrix(x_t, cache->x_t);
+    copyMatrix(h_prev, cache->h_prev);
+    copyMatrix(c_prev, cache->c_prev);
+    
+    // Input gate: i_t = sigmoid(W_xi * x_t + W_hi * h_prev + b_i)
+    Matrix i_gate = createMatrix(cell->hidden_size, 1);
+    
+    matmul(cell->W_xi, x_t, ws->temp1);
+    matmul(cell->W_hi, h_prev, ws->temp2);
+    add(ws->temp1, ws->temp2, i_gate);
+    add(i_gate, cell->b_i, i_gate);
+    sigmoid(i_gate);
+    
+    // Forget gate: f_t = sigmoid(W_xf * x_t + W_hf * h_prev + b_f)
+    Matrix f_gate = createMatrix(cell->hidden_size, 1);
+    matmul(cell->W_xf, x_t, ws->temp1);
+    matmul(cell->W_hf, h_prev, ws->temp2);
+    add(ws->temp1, ws->temp2, f_gate);
+    add(f_gate, cell->b_f, f_gate);
+    sigmoid(f_gate);
+    
+    // Output gate: o_t = sigmoid(W_xo * x_t + W_ho * h_prev + b_o)
+    Matrix o_gate = createMatrix(cell->hidden_size, 1);
+    matmul(cell->W_xo, x_t, ws->temp1);
+    matmul(cell->W_ho, h_prev, ws->temp2);
+    add(ws->temp1, ws->temp2, o_gate);
+    add(o_gate, cell->b_o, o_gate);
+    sigmoid(o_gate);
+    
+    // Cell candidate: c_tilde = tanh(W_xc * x_t + W_hc * h_prev + b_c)
+    Matrix c_tilde = createMatrix(cell->hidden_size, 1);
+    matmul(cell->W_xc, x_t, ws->temp1);
+    matmul(cell->W_hc, h_prev, ws->temp2);
+    add(ws->temp1, ws->temp2, c_tilde);
+    add(c_tilde, cell->b_c, c_tilde);
+    tanhInplace(c_tilde);
+    
+    // Cell state: c_t = f_t * c_prev + i_t * c_tilde
+    Matrix c_new = createMatrix(cell->hidden_size, 1);
+    hadamard(f_gate, c_prev, ws->temp_c1);
+    hadamard(i_gate, c_tilde, ws->temp_c2);
+    add(ws->temp_c1, ws->temp_c2, c_new);
+    
+    // Hidden state: h_t = o_t * tanh(c_t)
+    Matrix h_new = createMatrix(cell->hidden_size, 1);
+    Matrix c_tanh = createMatrix(cell->hidden_size, 1);
+    copyMatrix(c_new, c_tanh);
+    tanhInplace(c_tanh);
+    hadamard(o_gate, c_tanh, h_new);
+    
+    // Save cache for backprop (gates need to persist)
+    cache->i_gate = i_gate;
+    cache->f_gate = f_gate;
+    cache->o_gate = o_gate;
+    cache->c_tilde = c_tilde;
+    cache->c_new = createMatrix(cell->hidden_size, 1);
+    copyMatrix(c_new, cache->c_new);
+    cache->h_new = createMatrix(cell->hidden_size, 1);
+    copyMatrix(h_new, cache->h_new);
+    cache->c_tanh = c_tanh;
+    
+    // Copy outputs
+    copyMatrix(h_new, *h_out);
+    copyMatrix(c_new, *c_out);
+    
+    // Free only the matrices not stored in cache
+    freeMatrix(c_new);
+    freeMatrix(h_new);
+    // Note: No sync here - let operations pipeline. Sync will happen when needed.
+}
+
 void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_next,
                   Matrix* dh_prev, Matrix* dc_prev, Matrix* dx) {
     int hidden_size = cell->hidden_size;
@@ -334,6 +474,102 @@ void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_ne
     freeMatrix(temp_grad_h);
     freeMatrix(dx_temp);
     freeMatrix(dh_temp);
+}
+
+// Workspace-based backward pass (no malloc/free per call - much faster)
+void lstmBackwardWS(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_next,
+                    Matrix* dh_prev, Matrix* dc_prev, Matrix* dx, LSTMWorkspace* ws) {
+    int hidden_size = cell->hidden_size;
+    int input_size = cell->input_size;
+    
+    // h_t = o_t * tanh(c_t)
+    // dL/do_t = dL/dh_t * tanh(c_t)
+    hadamard(dh_next, cache->c_tanh, ws->do_gate);
+    
+    // dL/dc_t (from h_t) = dL/dh_t * o_t * (1 - tanh(c_t)^2)
+    // Sync only once before CPU reads
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for(int i = 0; i < hidden_size; i++) {
+        float t = cache->c_tanh.data[i];
+        ws->one_minus_tanh_sq.data[i] = 1.0f - t * t;
+    }
+    hadamard(dh_next, cache->o_gate, ws->dc_from_h);
+    hadamard(ws->dc_from_h, ws->one_minus_tanh_sq, ws->dc_from_h);
+    
+    // Total dL/dc_t
+    add(ws->dc_from_h, dc_next, ws->dc);
+    
+    // dL/df_t = dL/dc_t * c_prev
+    hadamard(ws->dc, cache->c_prev, ws->df_gate);
+    
+    // dL/di_t = dL/dc_t * c_tilde
+    hadamard(ws->dc, cache->c_tilde, ws->di_gate);
+    
+    // dL/dc_tilde = dL/dc_t * i_t
+    hadamard(ws->dc, cache->i_gate, ws->dc_tilde);
+    
+    // dL/dc_prev = dL/dc_t * f_t
+    *dc_prev = createMatrix(hidden_size, 1);
+    hadamard(ws->dc, cache->f_gate, *dc_prev);
+    
+    // Backprop through activations
+    sigmoidBackward(ws->do_gate, cache->o_gate, ws->do_pre);
+    sigmoidBackward(ws->df_gate, cache->f_gate, ws->df_pre);
+    sigmoidBackward(ws->di_gate, cache->i_gate, ws->di_pre);
+    tanhBackward(ws->dc_tilde, cache->c_tilde, ws->dc_tilde_pre);
+    
+    // Accumulate gradients for weights and biases
+    matmulTranspose(ws->di_pre, cache->x_t, ws->temp_grad);
+    addInplace(cell->dW_xi, ws->temp_grad);
+    matmulTranspose(ws->di_pre, cache->h_prev, ws->temp_grad_h);
+    addInplace(cell->dW_hi, ws->temp_grad_h);
+    addInplace(cell->db_i, ws->di_pre);
+    
+    matmulTranspose(ws->df_pre, cache->x_t, ws->temp_grad);
+    addInplace(cell->dW_xf, ws->temp_grad);
+    matmulTranspose(ws->df_pre, cache->h_prev, ws->temp_grad_h);
+    addInplace(cell->dW_hf, ws->temp_grad_h);
+    addInplace(cell->db_f, ws->df_pre);
+    
+    matmulTranspose(ws->do_pre, cache->x_t, ws->temp_grad);
+    addInplace(cell->dW_xo, ws->temp_grad);
+    matmulTranspose(ws->do_pre, cache->h_prev, ws->temp_grad_h);
+    addInplace(cell->dW_ho, ws->temp_grad_h);
+    addInplace(cell->db_o, ws->do_pre);
+    
+    matmulTranspose(ws->dc_tilde_pre, cache->x_t, ws->temp_grad);
+    addInplace(cell->dW_xc, ws->temp_grad);
+    matmulTranspose(ws->dc_tilde_pre, cache->h_prev, ws->temp_grad_h);
+    addInplace(cell->dW_hc, ws->temp_grad_h);
+    addInplace(cell->db_c, ws->dc_tilde_pre);
+    
+    // Compute dx (gradient w.r.t. input)
+    *dx = createMatrix(input_size, 1);
+    fillMatrix(*dx, 0.0f);
+    
+    transposeMatmul(cell->W_xi, ws->di_pre, ws->dx_temp);
+    addInplace(*dx, ws->dx_temp);
+    transposeMatmul(cell->W_xf, ws->df_pre, ws->dx_temp);
+    addInplace(*dx, ws->dx_temp);
+    transposeMatmul(cell->W_xo, ws->do_pre, ws->dx_temp);
+    addInplace(*dx, ws->dx_temp);
+    transposeMatmul(cell->W_xc, ws->dc_tilde_pre, ws->dx_temp);
+    addInplace(*dx, ws->dx_temp);
+    
+    // Compute dh_prev
+    *dh_prev = createMatrix(hidden_size, 1);
+    fillMatrix(*dh_prev, 0.0f);
+    
+    transposeMatmul(cell->W_hi, ws->di_pre, ws->dh_temp);
+    addInplace(*dh_prev, ws->dh_temp);
+    transposeMatmul(cell->W_hf, ws->df_pre, ws->dh_temp);
+    addInplace(*dh_prev, ws->dh_temp);
+    transposeMatmul(cell->W_ho, ws->do_pre, ws->dh_temp);
+    addInplace(*dh_prev, ws->dh_temp);
+    transposeMatmul(cell->W_hc, ws->dc_tilde_pre, ws->dh_temp);
+    addInplace(*dh_prev, ws->dh_temp);
+    
+    // Note: No sync here - let operations pipeline. Sync at end of backward pass.
 }
 
 void lstmForward(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev, Matrix* h_out, Matrix* c_out) {

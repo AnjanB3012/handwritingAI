@@ -297,6 +297,12 @@ int main(int argc, char* argv[]) {
     initStartCoordDNN(&dnn_model, vocab_size, 16, hidden_dims, 2);
     initStartCoordDNNGradients(&dnn_model);
     
+    // Initialize training workspace (pre-allocate all temp buffers for speed)
+    TextConditionedLSTMTrainingWorkspace training_ws;
+    int max_text_len = 256;  // Max text length we'll support
+    initTextConditionedLSTMTrainingWorkspace(&training_ws, 5, hidden_size, embed_dim, 6, max_text_len);
+    printf("  Training workspace initialized (pre-allocated buffers for speed)\n");
+    
     // Print header with data summary
     printf("\n");
     printf("================================================================================\n");
@@ -373,15 +379,17 @@ int main(int argc, char* argv[]) {
             // Zero gradients
             zeroTextConditionedLSTMGradients(&lstm_model);
             
-            // Forward pass with cache
+            // Forward pass with cache (using workspace for speed)
             Matrix output;
             TextConditionedLSTMCache cache;
-            textConditionedLSTMForwardWithCache(&lstm_model, text_seq, text_len,
-                                                stroke_inputs, stroke_len, &output, &cache);
+            textConditionedLSTMForwardWithCacheWS(&lstm_model, text_seq, text_len,
+                                                  stroke_inputs, stroke_len, &output, &cache,
+                                                  &training_ws);
             
-            // Backward pass
+            // Backward pass (using workspace for speed)
             float sample_loss;
-            textConditionedLSTMBackward(&lstm_model, &cache, stroke_targets, stroke_len, &sample_loss);
+            textConditionedLSTMBackwardWS(&lstm_model, &cache, stroke_targets, stroke_len, &sample_loss,
+                                          &training_ws);
             
             // Apply gradients
             applyTextConditionedLSTMGradients(&lstm_model, LEARNING_RATE);
@@ -475,6 +483,7 @@ int main(int argc, char* argv[]) {
     printf("\n");
     
     // Cleanup
+    freeTextConditionedLSTMTrainingWorkspace(&training_ws);
     freeTextConditionedLSTM(&lstm_model);
     freeStartCoordDNN(&dnn_model);
     

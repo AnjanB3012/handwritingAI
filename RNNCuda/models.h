@@ -57,6 +57,40 @@ struct TextConditionedLSTMCache {
     int text_len;
 };
 
+// Pre-allocated workspace for training (avoids malloc/free per sample)
+struct TextConditionedLSTMTrainingWorkspace {
+    // LSTM workspace
+    LSTMWorkspace lstm_ws;
+    
+    // Forward pass temporaries
+    Matrix h_prev, c_prev;
+    Matrix h_new, c_new;
+    Matrix combined_input;
+    Matrix fc1_pre, fc2_out;
+    Matrix text_emb;
+    
+    // Backward pass temporaries
+    Matrix dh_next, dc_next;
+    Matrix dout;
+    Matrix dfc_W_temp, dfc1_out, dfc1_pre;
+    Matrix dfc_hidden_W_temp, dh;
+    
+    int hidden_size;
+    int input_size;
+    int embed_dim;
+    int output_size;
+    int max_text_len;
+    bool initialized;
+};
+
+// Initialize training workspace
+void initTextConditionedLSTMTrainingWorkspace(TextConditionedLSTMTrainingWorkspace* ws,
+                                               int input_size, int hidden_size, 
+                                               int embed_dim, int output_size, int max_text_len);
+
+// Free training workspace
+void freeTextConditionedLSTMTrainingWorkspace(TextConditionedLSTMTrainingWorkspace* ws);
+
 // Initialize models
 void initTextConditionedLSTM(TextConditionedLSTM* model, int vocab_size, int embed_dim, 
                              int input_size, int hidden_size, int num_layers, int output_size);
@@ -80,9 +114,20 @@ void textConditionedLSTMForwardWithCache(TextConditionedLSTM* model, int* text_s
                                          Matrix* stroke_seq, int stroke_len, Matrix* output,
                                          TextConditionedLSTMCache* cache);
 
+// Forward pass with workspace (faster - uses pre-allocated buffers)
+void textConditionedLSTMForwardWithCacheWS(TextConditionedLSTM* model, int* text_seq, int text_len,
+                                           Matrix* stroke_seq, int stroke_len, Matrix* output,
+                                           TextConditionedLSTMCache* cache,
+                                           TextConditionedLSTMTrainingWorkspace* ws);
+
 // Backward pass
 void textConditionedLSTMBackward(TextConditionedLSTM* model, TextConditionedLSTMCache* cache,
                                  Matrix* target_seq, int seq_len, float* loss);
+
+// Backward pass with workspace (faster - uses pre-allocated buffers)
+void textConditionedLSTMBackwardWS(TextConditionedLSTM* model, TextConditionedLSTMCache* cache,
+                                   Matrix* target_seq, int seq_len, float* loss,
+                                   TextConditionedLSTMTrainingWorkspace* ws);
 
 void startCoordDNNForward(StartCoordDNN* model, int first_char_idx, float* len_features, Matrix* output);
 
