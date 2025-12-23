@@ -1,7 +1,7 @@
 NVCC = nvcc
 CXX = g++
-NVCCFLAGS = -arch=sm_75 -O3 -std=c++11
-CXXFLAGS = -O3 -std=c++11
+NVCCFLAGS = -arch=sm_75 -O3 -std=c++14
+CXXFLAGS = -O3 -std=c++14
 
 # Source files
 MATRIX_SRC = matrix.cu
