@@ -1,6 +1,5 @@
 #include "lstm.h"
 #include <cstdlib>
-#include <cstdio>
 #include <cmath>
 
 void initLSTMCell(LSTMCell* cell, int input_size, int hidden_size) {
@@ -86,23 +85,10 @@ void zeroLSTMCellGradients(LSTMCell* cell) {
 
 void lstmForwardWithCache(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev,
                           Matrix* h_out, Matrix* c_out, LSTMCache* cache) {
-    // Check dimensions
-    if(cell->W_xi.cols != x_t.rows) {
-        fprintf(stderr, "LSTM dim mismatch: W_xi.cols=%d, x_t.rows=%d\n", cell->W_xi.cols, x_t.rows);
-        fflush(stderr);
-    }
-    
     // Save inputs for backprop
     cache->x_t = createMatrix(x_t.rows, x_t.cols);
     cache->h_prev = createMatrix(h_prev.rows, h_prev.cols);
     cache->c_prev = createMatrix(c_prev.rows, c_prev.cols);
-    
-    if(cache->x_t.data == NULL || cache->h_prev.data == NULL || cache->c_prev.data == NULL) {
-        fprintf(stderr, "LSTM cache allocation failed!\n");
-        fflush(stderr);
-        return;
-    }
-    
     copyMatrix(x_t, cache->x_t);
     copyMatrix(h_prev, cache->h_prev);
     copyMatrix(c_prev, cache->c_prev);
@@ -112,20 +98,8 @@ void lstmForwardWithCache(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_pr
     Matrix temp1 = createMatrix(cell->hidden_size, 1);
     Matrix temp2 = createMatrix(cell->hidden_size, 1);
     
-    if(i_gate.data == NULL || temp1.data == NULL || temp2.data == NULL) {
-        fprintf(stderr, "LSTM gate allocation failed!\n");
-        fflush(stderr);
-        return;
-    }
-    
     matmul(cell->W_xi, x_t, temp1);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK_LAST();
-    
     matmul(cell->W_hi, h_prev, temp2);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK_LAST();
-    
     add(temp1, temp2, i_gate);
     add(i_gate, cell->b_i, i_gate);
     sigmoid(i_gate);
@@ -183,6 +157,9 @@ void lstmForwardWithCache(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_pr
     // Copy outputs
     copyMatrix(h_new, *h_out);
     copyMatrix(c_new, *c_out);
+    
+    // Sync before freeing - kernels may still be using this memory
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     // Free temporary matrices (not cache)
     freeMatrix(temp1);
@@ -338,6 +315,9 @@ void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_ne
     transposeMatmul(cell->W_hc, dc_tilde_pre, dh_temp);
     addInplace(*dh_prev, dh_temp);
     
+    // Sync before freeing - kernels may still be using this memory
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Cleanup
     freeMatrix(do_gate);
     freeMatrix(dc_from_h);
@@ -410,6 +390,9 @@ void lstmForward(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_prev, Matri
     // Copy outputs
     copyMatrix(h_new, *h_out);
     copyMatrix(c_new, *c_out);
+    
+    // Sync before freeing - kernels may still be using this memory
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     // Free temporary matrices
     freeMatrix(i_gate);
