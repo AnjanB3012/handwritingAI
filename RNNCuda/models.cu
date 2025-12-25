@@ -427,10 +427,12 @@ void textConditionedLSTMForwardWithCacheWS(TextConditionedLSTM* model, int* text
         
         copyMatrix(ws->h_new, ws->h_prev);
         copyMatrix(ws->c_new, ws->c_prev);
+        
+        // Sync before next iteration's CPU writes to workspace buffers
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
     
-    // Final sync and copy outputs
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Copy outputs (already synced from last iteration)
     
     *output = createMatrix(stroke_len, model->output_size);
     for(int t = 0; t < stroke_len; t++) {

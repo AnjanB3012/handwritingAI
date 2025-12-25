@@ -304,10 +304,12 @@ void lstmForwardWithCacheWS(LSTMCell* cell, Matrix x_t, Matrix h_prev, Matrix c_
     copyMatrix(h_new, *h_out);
     copyMatrix(c_new, *c_out);
     
+    // Sync before freeing - kernels may still be using this memory
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
     // Free only the matrices not stored in cache
     freeMatrix(c_new);
     freeMatrix(h_new);
-    // Note: No sync here - let operations pipeline. Sync will happen when needed.
 }
 
 void lstmBackward(LSTMCell* cell, LSTMCache* cache, Matrix dh_next, Matrix dc_next,
