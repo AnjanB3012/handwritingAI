@@ -42,3 +42,4 @@ backend/test*.py
 RNNModel/my_model.keras
 RNNModel/my_model_metadata.json
 RNNModel/input_data.json
+RNNModel/output.json
