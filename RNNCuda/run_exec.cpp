@@ -9,7 +9,7 @@
 #include <cstdio>
 
 // Maximum generation steps
-const int MAX_STEPS = 1200;
+const int MAX_STEPS = 100;
 
 void print_progress_bar(int current, int total, int width = 30) {
     float progress = (float)current / total;
