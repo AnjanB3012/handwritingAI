@@ -13,6 +13,44 @@
 const int EPOCHS = 50;
 const float LEARNING_RATE = 0.001f;
 const int MAX_SEQ_LEN = 50;
+const int PROGRESS_UPDATE_INTERVAL = 10;  // Update progress every N samples
+
+// Pre-allocated workspace for training samples (avoids malloc/free per sample)
+struct TrainingSampleWorkspace {
+    Matrix* stroke_inputs;   // Pre-allocated array of input matrices
+    Matrix* stroke_targets;  // Pre-allocated array of target matrices
+    int* text_seq;           // Pre-allocated text sequence buffer
+    int max_seq_len;
+    int max_text_len;
+    bool initialized;
+};
+
+void initTrainingSampleWorkspace(TrainingSampleWorkspace* ws, int max_seq_len, int max_text_len) {
+    ws->max_seq_len = max_seq_len;
+    ws->max_text_len = max_text_len;
+    ws->stroke_inputs = new Matrix[max_seq_len];
+    ws->stroke_targets = new Matrix[max_seq_len];
+    ws->text_seq = new int[max_text_len];
+    
+    for (int i = 0; i < max_seq_len; i++) {
+        ws->stroke_inputs[i] = createMatrix(5, 1);
+        ws->stroke_targets[i] = createMatrix(6, 1);
+    }
+    cudaDeviceSynchronize();
+    ws->initialized = true;
+}
+
+void freeTrainingSampleWorkspace(TrainingSampleWorkspace* ws) {
+    if (!ws->initialized) return;
+    for (int i = 0; i < ws->max_seq_len; i++) {
+        freeMatrix(ws->stroke_inputs[i]);
+        freeMatrix(ws->stroke_targets[i]);
+    }
+    delete[] ws->stroke_inputs;
+    delete[] ws->stroke_targets;
+    delete[] ws->text_seq;
+    ws->initialized = false;
+}
 
 // Timer helper using clock()
 class Timer {
@@ -253,6 +291,94 @@ void freeTrainingSample(int* text_seq, Matrix* stroke_inputs, Matrix* stroke_tar
     delete[] stroke_targets;
 }
 
+// Optimized version using pre-allocated workspace (no malloc/free per sample)
+bool prepareTrainingSampleWS(const TrainingEntry& entry, 
+                             const std::map<char, int>& char2idx,
+                             float* mean, float* std_dev,
+                             TrainingSampleWorkspace* ws,
+                             int* text_len_out, int* stroke_len_out) {
+    
+    if(entry.stroke_data.size() < 3) return false;
+    
+    // Encode text (use pre-allocated buffer)
+    int text_len = std::min((int)entry.entry_text.length(), ws->max_text_len);
+    *text_len_out = text_len;
+    for(int i = 0; i < text_len; i++) {
+        auto it = char2idx.find(entry.entry_text[i]);
+        ws->text_seq[i] = (it != char2idx.end()) ? it->second : 0;
+    }
+    
+    // Sort stroke points by timestamp
+    std::vector<std::pair<std::string, StrokePoint>> sorted_points;
+    sorted_points.reserve(entry.stroke_data.size());
+    for(const auto& p : entry.stroke_data) {
+        sorted_points.push_back(p);
+    }
+    std::sort(sorted_points.begin(), sorted_points.end(),
+              [](const auto& a, const auto& b) {
+                  return a.second.timestamp < b.second.timestamp;
+              });
+    
+    // Limit sequence length
+    int seq_len = std::min((int)sorted_points.size() - 1, ws->max_seq_len);
+    if(seq_len < 2) return false;
+    
+    *stroke_len_out = seq_len;
+    
+    float prev_x = sorted_points[0].second.coordinates[0];
+    float prev_y = sorted_points[0].second.coordinates[1];
+    float prev_t = sorted_points[0].second.timestamp;
+    
+    // Fill pre-allocated matrices (no createMatrix calls!)
+    for(int i = 0; i < seq_len; i++) {
+        const auto& curr = sorted_points[i + 1].second;
+        
+        // Compute deltas
+        float dx = curr.coordinates[0] - prev_x;
+        float dy = curr.coordinates[1] - prev_y;
+        float dt = curr.timestamp - prev_t;
+        
+        // Normalize
+        float dx_norm = (dx - mean[0]) / std_dev[0];
+        float dy_norm = (dy - mean[1]) / std_dev[1];
+        float dt_norm = (dt - mean[2]) / std_dev[2];
+        
+        // Input: current state (use pre-allocated matrix)
+        if(i == 0) {
+            ws->stroke_inputs[i].data[0] = 0.0f;
+            ws->stroke_inputs[i].data[1] = 0.0f;
+            ws->stroke_inputs[i].data[2] = 0.0f;
+            ws->stroke_inputs[i].data[3] = 0.0f;
+            ws->stroke_inputs[i].data[4] = 0.0f;
+        } else {
+            const auto& prev_point = sorted_points[i].second;
+            const auto& prev_prev = sorted_points[i - 1].second;
+            float prev_dx = prev_point.coordinates[0] - prev_prev.coordinates[0];
+            float prev_dy = prev_point.coordinates[1] - prev_prev.coordinates[1];
+            float prev_dt = prev_point.timestamp - prev_prev.timestamp;
+            ws->stroke_inputs[i].data[0] = (prev_dx - mean[0]) / std_dev[0];
+            ws->stroke_inputs[i].data[1] = (prev_dy - mean[1]) / std_dev[1];
+            ws->stroke_inputs[i].data[2] = (prev_dt - mean[2]) / std_dev[2];
+            ws->stroke_inputs[i].data[3] = prev_point.pressure;
+            ws->stroke_inputs[i].data[4] = prev_point.tilt;
+        }
+        
+        // Target: next deltas (use pre-allocated matrix)
+        ws->stroke_targets[i].data[0] = dx_norm;
+        ws->stroke_targets[i].data[1] = dy_norm;
+        ws->stroke_targets[i].data[2] = dt_norm;
+        ws->stroke_targets[i].data[3] = curr.pressure;
+        ws->stroke_targets[i].data[4] = curr.tilt;
+        ws->stroke_targets[i].data[5] = (i == seq_len - 1) ? 1.0f : 0.0f;
+        
+        prev_x = curr.coordinates[0];
+        prev_y = curr.coordinates[1];
+        prev_t = curr.timestamp;
+    }
+    
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     if(argc != 3) {
         fprintf(stderr, "Usage: %s <output.bin> <input_data.json>\n", argv[0]);
@@ -301,7 +427,11 @@ int main(int argc, char* argv[]) {
     TextConditionedLSTMTrainingWorkspace training_ws;
     int max_text_len = 256;  // Max text length we'll support
     initTextConditionedLSTMTrainingWorkspace(&training_ws, 5, hidden_size, embed_dim, 6, max_text_len);
-    printf("  Training workspace initialized (pre-allocated buffers for speed)\n");
+    
+    // Initialize sample workspace (pre-allocate stroke matrices)
+    TrainingSampleWorkspace sample_ws;
+    initTrainingSampleWorkspace(&sample_ws, MAX_SEQ_LEN, max_text_len);
+    printf("  Training workspaces initialized (pre-allocated buffers for speed)\n");
     
     // Print header with data summary
     printf("\n");
@@ -362,16 +492,12 @@ int main(int argc, char* argv[]) {
         for(size_t idx = 0; idx < entries.size(); idx++) {
             const auto& entry = entries[indices[idx]];
             
-            // Prepare training sample
-            int* text_seq;
+            // Prepare training sample using workspace (no malloc per sample!)
             int text_len;
-            Matrix* stroke_inputs;
-            Matrix* stroke_targets;
             int stroke_len;
             
-            if(!prepareTrainingSample(entry, char2idx, mean, std_dev,
-                                      &text_seq, &text_len,
-                                      &stroke_inputs, &stroke_targets, &stroke_len)) {
+            if(!prepareTrainingSampleWS(entry, char2idx, mean, std_dev,
+                                        &sample_ws, &text_len, &stroke_len)) {
                 epoch_skipped++;
                 continue;
             }
@@ -382,13 +508,13 @@ int main(int argc, char* argv[]) {
             // Forward pass with cache (using workspace for speed)
             Matrix output;
             TextConditionedLSTMCache cache;
-            textConditionedLSTMForwardWithCacheWS(&lstm_model, text_seq, text_len,
-                                                  stroke_inputs, stroke_len, &output, &cache,
+            textConditionedLSTMForwardWithCacheWS(&lstm_model, sample_ws.text_seq, text_len,
+                                                  sample_ws.stroke_inputs, stroke_len, &output, &cache,
                                                   &training_ws);
             
             // Backward pass (using workspace for speed)
             float sample_loss;
-            textConditionedLSTMBackwardWS(&lstm_model, &cache, stroke_targets, stroke_len, &sample_loss,
+            textConditionedLSTMBackwardWS(&lstm_model, &cache, sample_ws.stroke_targets, stroke_len, &sample_loss,
                                           &training_ws);
             
             // Apply gradients
@@ -402,36 +528,37 @@ int main(int argc, char* argv[]) {
             running_loss = (running_loss * running_count + sample_loss) / (running_count + 1);
             running_count = std::min(running_count + 1, RUNNING_WINDOW);
             
-            // Cleanup
+            // Cleanup (only output and cache - workspace is reused!)
             freeMatrix(output);
             freeTextConditionedLSTMCache(&cache);
-            freeTrainingSample(text_seq, stroke_inputs, stroke_targets, stroke_len);
             
-            // Update progress display
-            double elapsed = epoch_timer.elapsed_seconds();
-            double samples_per_sec = (elapsed > 0) ? epoch_samples / elapsed : 0;
-            double total_elapsed = total_timer.elapsed_seconds();
-            double avg_epoch_time = total_elapsed / (epoch + (idx + 1.0) / entries.size());
-            double total_eta = avg_epoch_time * EPOCHS - total_elapsed;
-            
-            char total_time_buf[64], eta_buf[64];
-            total_timer.format_time(total_elapsed, total_time_buf, sizeof(total_time_buf));
-            total_timer.format_time(total_eta > 0 ? total_eta : 0, eta_buf, sizeof(eta_buf));
-            
-            // Print two-line progress
-            printf("\r  Overall: ");
-            print_progress_bar(epoch * entries.size() + idx + 1, EPOCHS * entries.size());
-            printf(" Epoch %2d/%-2d | Best: %.4f | Time: %s | ETA: %s        \n",
-                   epoch + 1, EPOCHS, best_loss < 1e9f ? best_loss : 0.0f, total_time_buf, eta_buf);
-            
-            printf("  Epoch:   ");
-            print_progress_bar(idx + 1, entries.size());
-            printf(" %3zu/%-3zu   | Loss: %.4f | %.1f samp/s                    ",
-                   idx + 1, entries.size(), running_loss, samples_per_sec);
-            
-            // Move cursor up one line for next update
-            printf("\033[1A\r");
-            fflush(stdout);
+            // Update progress display (only every N samples to reduce I/O overhead)
+            if ((idx + 1) % PROGRESS_UPDATE_INTERVAL == 0 || idx == entries.size() - 1) {
+                double elapsed = epoch_timer.elapsed_seconds();
+                double samples_per_sec = (elapsed > 0) ? epoch_samples / elapsed : 0;
+                double total_elapsed = total_timer.elapsed_seconds();
+                double avg_epoch_time = total_elapsed / (epoch + (idx + 1.0) / entries.size());
+                double total_eta = avg_epoch_time * EPOCHS - total_elapsed;
+                
+                char total_time_buf[64], eta_buf[64];
+                total_timer.format_time(total_elapsed, total_time_buf, sizeof(total_time_buf));
+                total_timer.format_time(total_eta > 0 ? total_eta : 0, eta_buf, sizeof(eta_buf));
+                
+                // Print two-line progress
+                printf("\r  Overall: ");
+                print_progress_bar(epoch * entries.size() + idx + 1, EPOCHS * entries.size());
+                printf(" Epoch %2d/%-2d | Best: %.4f | Time: %s | ETA: %s        \n",
+                       epoch + 1, EPOCHS, best_loss < 1e9f ? best_loss : 0.0f, total_time_buf, eta_buf);
+                
+                printf("  Epoch:   ");
+                print_progress_bar(idx + 1, entries.size());
+                printf(" %3zu/%-3zu   | Loss: %.4f | %.1f samp/s                    ",
+                       idx + 1, entries.size(), running_loss, samples_per_sec);
+                
+                // Move cursor up one line for next update
+                printf("\033[1A\r");
+                fflush(stdout);
+            }
         }
         
         // End of epoch - move to new lines
@@ -483,6 +610,7 @@ int main(int argc, char* argv[]) {
     printf("\n");
     
     // Cleanup
+    freeTrainingSampleWorkspace(&sample_ws);
     freeTextConditionedLSTMTrainingWorkspace(&training_ws);
     freeTextConditionedLSTM(&lstm_model);
     freeStartCoordDNN(&dnn_model);
